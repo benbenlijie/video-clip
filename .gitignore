@@ -1,0 +1,25 @@
+# Runtime data and local secrets
+portal/.env
+portal/.env.*
+!portal/.env.example
+portal/storage/
+portal/dist/
+portal/node_modules/
+
+# Other local/build output
+openchatcut-src/node_modules/
+openchatcut-src/dist/
+*.tsbuildinfo
+.playwright-cli/
+.playwright-mcp/
+.spec-workflow/
+.research/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Generated Vite config declarations
+portal/vite.config.d.ts
+portal/vite.config.js

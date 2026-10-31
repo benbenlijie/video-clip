@@ -1,0 +1,10 @@
+{
+  "name": "hyperframes-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node ../hyperframes-runtime/node_modules/hyperframes/bin/hyperframes.mjs preview",
+    "check": "node ../hyperframes-runtime/node_modules/hyperframes/bin/hyperframes.mjs lint && node ../hyperframes-runtime/node_modules/hyperframes/bin/hyperframes.mjs check",
+    "render": "node ../hyperframes-runtime/node_modules/hyperframes/bin/hyperframes.mjs render --format mov --output renders/wayne-overlay.mov"
+  }
+}

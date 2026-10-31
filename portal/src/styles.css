@@ -53,3 +53,56 @@ button { cursor: pointer; }
   .transcript-list p { grid-template-columns: 3.2rem minmax(0, 1fr); align-items: start; padding: .75rem .2rem; }
   .transcript-list b { grid-column: 2; justify-self: start; margin-top: .2rem; }
 }
+.music-upload-card { display: grid; gap: .7rem; margin-top: 1rem; padding: .9rem; border: 1px solid var(--line); border-radius: 8px; background: #151a15; }.music-upload-card > label:first-child { display: flex; flex-wrap: wrap; gap: .3rem .6rem; align-items: baseline; color: var(--cream); font-size: .76rem; }.music-upload-card > label:first-child small, .music-note { color: var(--muted); font-size: .68rem; }.music-upload-card > input[type="file"] { width: 100%; color: var(--muted); font-size: .7rem; }.license-check { display: flex; align-items: flex-start; gap: .5rem; color: #c7d1c0; font-size: .7rem; line-height: 1.45; }.license-check input { flex: none; width: 1rem; height: 1rem; accent-color: var(--mint); }.music-note { margin: 0; line-height: 1.5; }
+@media (max-width: 420px) { .music-upload-card { padding: .75rem; }.music-upload-card > input[type="file"] { max-width: 100%; }.delivery-proof { font-size: .58rem; } }
+.broll-upload-card { display: grid; gap: .65rem; margin-top: 1rem; padding: .9rem; border: 1px solid var(--line); border-radius: 8px; background: #151a15; }.broll-upload-card > label { display: flex; flex-wrap: wrap; gap: .3rem .6rem; align-items: baseline; color: var(--cream); font-size: .76rem; }.broll-upload-card label small, .broll-upload-card > small { color: var(--muted); font-size: .68rem; line-height: 1.5; }.broll-upload-card > input { width: 100%; color: var(--muted); font-size: .7rem; }.broll-upload-card ul { display: grid; gap: .3rem; margin: 0; padding-left: 1.1rem; color: var(--mint); font-size: .67rem; }.broll-event { display: flex; flex-wrap: wrap; gap: .35rem .7rem; align-items: baseline; padding: .65rem; border-left: 3px solid var(--blue); background: #151a15; font-size: .72rem; }.broll-event time, .broll-event small { color: var(--muted); font: .62rem var(--mono); }
+.broll-search-card { display: grid; gap: .8rem; margin: 1rem 0; padding: 1rem; border: 1px solid #53654a; border-radius: 8px; background: linear-gradient(135deg,#1d261c,#151815 75%); }.broll-search-heading, .broll-search-scene-heading { display: flex; flex-wrap: wrap; gap: .55rem 1rem; align-items: center; justify-content: space-between; }.broll-search-heading .eyebrow { margin: 0 0 .25rem; color: var(--mint); font: .61rem var(--mono); }.broll-search-heading h4 { margin: 0; color: var(--cream); font-size: .95rem; }.broll-search-heading > span, .broll-search-scene-heading > span { color: var(--muted); font: .62rem var(--mono); }.broll-search-copy { display: grid; gap: .4rem; color: var(--muted); font-size: .7rem; }.broll-search-copy textarea { width: 100%; min-height: 5.5rem; padding: .7rem; border: 1px solid var(--line); border-radius: 6px; color: var(--cream); background: #111411; resize: vertical; }.broll-search-controls { display: flex; flex-wrap: wrap; align-items: end; gap: .6rem; }.broll-search-controls label { display: grid; gap: .3rem; color: var(--muted); font-size: .67rem; }.broll-search-controls select { min-height: 2.75rem; padding: .5rem; color: var(--cream); border: 1px solid var(--line); border-radius: 6px; background: #111411; }.broll-search-note, .broll-search-disclaimer { margin: 0; color: var(--muted); font-size: .66rem; line-height: 1.5; }.broll-search-scene { display: grid; gap: .6rem; padding-top: .75rem; border-top: 1px solid var(--line); }.broll-search-scene-heading > div { display: grid; gap: .28rem; }.broll-search-scene-heading strong { color: var(--cream); font-size: .78rem; }.broll-search-scene-heading small, .broll-search-error { color: var(--muted); font-size: .65rem; }.broll-search-error { color: #e9c47a; }.broll-candidate-grid { display: grid; grid-template-columns: minmax(0,1fr); gap: .65rem; }.broll-candidate { min-width: 0; display: grid; gap: .4rem; padding: .55rem; border: 1px solid var(--line); border-radius: 7px; background: #111411; }.broll-candidate video { display: block; width: 100%; max-height: 18rem; aspect-ratio: 16/9; object-fit: contain; background: #090b09; border-radius: 4px; }.broll-candidate-meta { display: flex; flex-wrap: wrap; gap: .35rem .6rem; align-items: center; color: var(--muted); font: .59rem var(--mono); }.score-pill { padding: .2rem .4rem; color: #172012; border-radius: 4px; background: var(--mint); }.broll-candidate > strong { color: var(--cream); font-size: .72rem; }.broll-candidate > small { color: var(--muted); font-size: .62rem; }.broll-candidate-links { display: flex; flex-wrap: wrap; gap: .4rem .75rem; }.broll-candidate-links a { color: var(--mint); font-size: .64rem; text-decoration: none; }
+@media (min-width: 700px) { .broll-candidate-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+
+/* Keep the primary video workflow visible before optional setup details. */
+.workflow-intro { max-width: 1280px; margin: 0 auto; padding: 1rem 1.25rem .35rem; }
+.workflow-intro .hero-copy { max-width: 58rem; }
+.workflow-intro .case-label { margin-bottom: .45rem; }
+.workflow-intro h2 { max-width: none; font-size: clamp(1.8rem, 4vw, 3rem); line-height: 1.08; letter-spacing: -.065em; }
+.workflow-intro .hero-copy > p { margin-top: .65rem; font-size: .9rem; }
+.workflow-intro .hero-actions { margin-top: .85rem; }
+.workspace { padding-top: 1.1rem; }
+.drop-zone { min-height: 11rem; }
+.advanced-options, .review-details, .review-advanced, .service-details { margin-top: 1rem; border: 1px solid var(--line); border-radius: 8px; background: #151a15; }
+.advanced-options > summary, .review-details > summary, .review-advanced > summary, .service-details > summary { min-height: 44px; display: flex; align-items: center; gap: .55rem; padding: .65rem .8rem; color: var(--cream); font-size: .76rem; font-weight: 650; cursor: pointer; }
+.advanced-options > summary span { color: var(--muted); font-size: .68rem; font-weight: 400; }
+.advanced-options[open], .review-details[open], .review-advanced[open], .service-details[open] { padding-bottom: .8rem; }
+.advanced-options > :not(summary), .review-details > :not(summary), .review-advanced > :not(summary), .service-details > p { margin-inline: .8rem; }
+.review-player { max-height: min(62vh, 48rem); }
+.preview-notes { line-height: 1.55; }
+.review-plan { display: grid; gap: .5rem; margin-top: 1rem; padding: .8rem; border: 1px solid var(--line); border-radius: 8px; background: #151a15; }
+.review-plan > span { color: var(--mint); font: .62rem var(--mono); text-transform: uppercase; letter-spacing: .08em; }
+.review-plan > strong { color: var(--cream); font-size: .82rem; line-height: 1.5; }
+.review-plan .review-details { margin-top: .2rem; }
+.review-timeline { margin-top: 1rem; }
+.comment-box { gap: .5rem; margin-top: .7rem; }
+.comment-box .comment-time { max-width: 6rem; }
+.comment-box input, .comment-box button { min-height: 44px; }
+.comment-box button { min-width: 44px; }
+.revise-button { width: 100%; margin-top: 1rem; }
+.revise-button + .continue-button { margin-top: .55rem; }
+.creation-progress { display: flex; align-items: flex-start; gap: .8rem; padding: 1rem; border: 1px solid var(--line); border-radius: 8px; background: #151a15; }
+.creation-progress strong { font-size: .84rem; }
+.creation-progress p { margin: .35rem 0 0; color: var(--muted); font-size: .74rem; line-height: 1.5; }
+.creation-pulse { flex: none; width: .65rem; height: .65rem; margin-top: .22rem; border-radius: 50%; background: var(--mint); box-shadow: 0 0 0 5px #c6f47516; animation: workflow-pulse 1.8s ease-in-out infinite; }
+.progress-media { overflow-wrap: anywhere; }
+.service-details > p { color: var(--muted); font-size: .7rem; line-height: 1.5; }
+@keyframes workflow-pulse { 50% { opacity: .4; box-shadow: 0 0 0 9px #c6f4750a; } }
+@media (min-width: 700px) { .workflow-intro, .workspace { padding-inline: 2.5rem; } }
+@media (min-width: 1024px) { .workflow-intro, .workspace { padding-inline: 4rem; } }
+@media (max-width: 699px) {
+  .workflow-intro { padding: .85rem 1rem .2rem; }
+  .workflow-intro .hero-copy > p { margin-top: .5rem; font-size: .84rem; }
+  .workflow-intro .hero-actions { margin-top: .65rem; }
+  .workspace { padding-top: .85rem; }
+  .stage-step { min-width: 8.2rem; }
+  .stage-step strong { font-size: .72rem; white-space: nowrap; }
+  .drop-zone { min-height: 10.5rem; padding: .8rem; }
+  .review-plan { padding: .7rem; }
+}
+@media (prefers-reduced-motion: reduce) { .creation-pulse { animation: none; } }

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN" data-resolution="landscape">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=1920,height=1080" />
+  <script src="./gsap.min.js"></script>
+  <style>
+    :root { --ink: #f1f3ea; --mint: #c6f475; --orange: #f58c53; --panel: rgba(17,19,17,.91); }
+    * { box-sizing: border-box; }
+    html, body { width: 1920px; height: 1080px; margin: 0; overflow: hidden; background: transparent; }
+    #root { position: relative; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+    .poster { position: absolute; z-index: 1; top: 4%; left: 4%; padding: 13px 27px; color: var(--mint); background: rgba(17,19,17,.94); border-left: 6px solid var(--orange); border-top: 2px solid var(--mint); }
+    .poster strong { display: block; font: 500 30px/1.2 Manrope,sans-serif; letter-spacing: .13em; }
+    .event { position: absolute; opacity: 0; color: var(--ink); background: linear-gradient(118deg,var(--panel),rgba(25,28,25,.78)); border-left: 12px solid var(--mint); border-top: 5px solid var(--orange); box-shadow: 0 24px 90px #0004; }
+    .event::before { content: attr(data-title); position: absolute; left: 68px; right: 68px; top: 48px; color: var(--ink); font: 800 82px/1.02 Manrope,sans-serif; letter-spacing: -.055em; overflow-wrap: anywhere; }
+    .event::after { content: attr(data-subtext); position: absolute; left: 72px; right: 76px; bottom: 38px; color: var(--mint); font: 600 34px/1.15 Manrope,sans-serif; overflow-wrap: anywhere; }
+    .title-card { top: 11%; left: 8.5%; width: 82%; height: 30%; }
+    .emphasis { left: 8%; bottom: 12%; width: 86%; height: 22%; border-left-color: var(--orange); }
+    .cta { right: 8%; bottom: 11%; width: 77%; height: 29%; border-left-color: var(--orange); }
+  </style>
+</head>
+<body>
+  <main id="root" data-composition-id="wayne-overlay" data-start="0" data-duration="5" data-width="1920" data-height="1080">
+    <div id="poster" class="poster"><strong>WAYNE / HYBRID EDIT</strong></div>
+    <section id="hook" class="clip event title-card" data-start="0" data-duration="1.8" data-track-index="0" data-title="Open with the promise" data-subtext="Then prove it with the footage" style="opacity:1"></section>
+    <section id="cta" class="clip event cta" data-start="2.4" data-duration="2.2" data-track-index="1" data-title="What do you think?" data-subtext="Tell me below"></section>
+  </main>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#poster", { opacity: 0, duration: .12, ease: "none" }, 2);
+    tl.fromTo("#hook", { y: 0, opacity: 1, scale: .97 }, { y: 0, opacity: 1, scale: 1, duration: .42, ease: "power3.out" }, 0);
+    tl.to("#hook", { y: -18, opacity: 0, duration: .24, ease: "power2.in" }, 1.56);
+    tl.fromTo("#cta", { y: 34, opacity: 0, scale: .97 }, { y: 0, opacity: 1, scale: 1, duration: .42, ease: "power3.out" }, 2.4);
+    tl.to("#cta", { y: -18, opacity: 0, duration: .24, ease: "power2.in" }, 4.26);
+    window.__timelines["wayne-overlay"] = tl;
+  </script>
+</body>
+</html>

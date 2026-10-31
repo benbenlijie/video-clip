@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Claude Opus 5.5 视频剪辑真实案例与工作流研究库" />
+    <title>Opus 5.5 / Video Case Library</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="返回首页">
+        <span class="brand-mark">O5</span>
+        <span class="brand-copy"><b>OPUS 5.5</b><small>VIDEO CASE LIBRARY</small></span>
+      </a>
+      <nav class="top-nav" aria-label="主导航">
+        <a href="#cases">案例</a>
+        <a href="#routes">路线</a>
+        <a href="#method">方法</a>
+      </nav>
+      <a class="source-link" href="./report.md" target="_blank" rel="noreferrer">打开完整报告 <span>↗</span></a>
+    </header>
+
+    <main id="top">
+      <section class="hero shell">
+        <div class="hero-copy reveal">
+          <div class="eyebrow"><span class="live-dot"></span> RESEARCH SNAPSHOT · 2026.10.28</div>
+          <h1>看见 AI<br /><em>真正做成了什么。</em></h1>
+          <p class="hero-lede">一份可浏览、可筛选、可复现的 Claude Opus 5.5 视频剪辑案例库。把作品表现、幕后工作流和证据强度放在同一张桌面上。</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#cases">浏览真实案例 <span>↓</span></a>
+            <a class="button button-quiet" href="#method">先看判断方法 <span>↗</span></a>
+          </div>
+        </div>
+        <div class="hero-console reveal delay-1" aria-label="研究摘要">
+          <div class="console-head"><span>LIVE INDEX</span><span class="console-status">● VERIFIED LINKS</span></div>
+          <div class="console-grid">
+            <div><strong>12</strong><span>公开案例</span></div>
+            <div><strong>03</strong><span>主工作路线</span></div>
+            <div><strong>14</strong><span>来源链接</span></div>
+            <div><strong>06</strong><span>可复现资产</span></div>
+          </div>
+          <div class="signal-line"><span>MODEL</span><b>claude-opus-5-5</b><span class="signal-bar"><i></i></span></div>
+          <div class="signal-line"><span>REALITY CHECK</span><b class="amber">agent + tools + human</b></div>
+        </div>
+      </section>
+
+      <section class="thesis shell reveal delay-2">
+        <div class="section-kicker">01 / THE THESIS</div>
+        <div class="thesis-layout">
+          <h2>成功的不是<br /><span>“一条提示词”。</span></h2>
+          <div class="thesis-note">
+            <p>最稳定的案例都把 Opus 5.5 当作后期编排代理：它读取转录、写 cut list、生成代码、调用渲染器，再接受时间戳批注。</p>
+            <div class="stack-tags"><span>TRANSCRIPT</span><span>SKILL</span><span>RENDERER</span><span>REVIEW LOOP</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="cases" class="case-section shell">
+        <div class="section-heading reveal">
+          <div><div class="section-kicker">02 / CASE INDEX</div><h2>作品现场</h2></div>
+          <p>按作品类型和证据强度筛选。<br />播放量是传播信号，不是质量证明。</p>
+        </div>
+        <div class="filters reveal delay-1">
+          <label class="search-box"><span>⌕</span><input id="search" type="search" placeholder="搜索作者、作品、工具…" autocomplete="off" /></label>
+          <div class="filter-group" role="group" aria-label="作品类型"><button class="filter active" data-type="all">全部</button><button class="filter" data-type="timeline">时间线</button><button class="filter" data-type="motion">动态图形</button><button class="filter" data-type="hybrid">混合后期</button></div>
+          <div class="filter-group evidence-filters" role="group" aria-label="证据等级"><button class="filter active" data-evidence="all">全部证据</button><button class="filter" data-evidence="A">A / 可复核</button><button class="filter" data-evidence="B">B / 作者自述</button></div>
+        </div>
+        <div class="result-line"><span id="result-count">12 个案例</span><span>更新于 2026.10.28</span></div>
+        <div id="case-grid" class="case-grid" aria-live="polite"></div>
+        <div id="empty-state" class="empty-state" hidden><span>∅</span><h3>没有匹配案例</h3><p>换一个关键词，或清除筛选。</p></div>
+      </section>
+
+      <section id="routes" class="routes-section shell">
+        <div class="section-heading reveal"><div><div class="section-kicker">03 / THE ROUTES</div><h2>三条成功路线</h2></div><p>从最容易复现的口播粗剪开始，<br />再向复杂的可编辑时间线推进。</p></div>
+        <div class="route-grid reveal delay-1">
+          <article class="route-card route-orange"><div class="route-num">01</div><div class="route-icon">◒</div><h3>转录驱动</h3><p>Whisper / Parakeet → Opus 5.5 → FFmpeg / NLE</p><div class="route-foot"><span>口播 · 屏录 · Shorts</span><b>最易复现</b></div></article>
+          <article class="route-card route-lime"><div class="route-num">02</div><div class="route-icon">✦</div><h3>代码动效</h3><p>HTML / Remotion / HyperFrames → 浏览器逐帧 → MP4</p><div class="route-foot"><span>图表 · UI · 品牌片</span><b>最可控</b></div></article>
+          <article class="route-card route-blue"><div class="route-num">03</div><div class="route-icon">↗</div><h3>NLE / MCP</h3><p>Claude Code → Resolve / InVideo / FCPXML → 人工收尾</p><div class="route-foot"><span>长视频 · 可编辑时间线</span><b>最接近生产</b></div></article>
+        </div>
+      </section>
+
+      <section id="method" class="method-section shell">
+        <div class="section-heading reveal"><div><div class="section-kicker">04 / HOW TO READ</div><h2>一眼读懂证据</h2></div><p>把“看起来不错”拆成<br />可检查的生产事实。</p></div>
+        <div class="method-layout reveal delay-1">
+          <div class="method-flow"><div class="flow-node"><small>INPUT</small><strong>素材 + 转录</strong><span>原始视频 / 字幕 / 品牌规则</span></div><div class="flow-arrow">→</div><div class="flow-node accent"><small>AGENT</small><strong>Opus 5.5</strong><span>计划 / 代码 / 工具调用</span></div><div class="flow-arrow">→</div><div class="flow-node"><small>RENDER</small><strong>媒体工具</strong><span>FFmpeg / Remotion / NLE</span></div><div class="flow-arrow">→</div><div class="flow-node check"><small>CHECK</small><strong>人工验收</strong><span>批注 / 回退 / 发布</span></div></div>
+          <div class="evidence-card"><div class="evidence-card-head"><span>证据等级</span><span>当前库</span></div><div class="evidence-row"><b>A</b><div><span class="evidence-track"><i style="width:58%"></i></span><small>作品 + 流程可复核</small></div><strong>7</strong></div><div class="evidence-row"><b>B</b><div><span class="evidence-track"><i style="width:38%"></i></span><small>流程/结果为作者自述</small></div><strong>5</strong></div><div class="evidence-row"><b>C</b><div><span class="evidence-track"><i style="width:12%"></i></span><small>仅作线索</small></div><strong>0</strong></div><p>播放量、标题和“one prompt”不构成独立质量证据。</p></div>
+        </div>
+      </section>
+
+      <section class="footer-cta shell reveal"><div><div class="section-kicker">NEXT EXPERIMENT</div><h2>从 60 秒口播开始。</h2><p>固定输入，保留 transcript、skill、源码和日志，再与人工基线比较。</p></div><a class="button button-primary" href="#cases">选择一个案例 <span>→</span></a></section>
+    </main>
+
+    <footer class="footer shell"><span>OPUS 5.5 / VIDEO CASE LIBRARY</span><span>本地研究可视化 · 所有收益均标注来源性质</span><a href="./report.md" target="_blank" rel="noreferrer">完整报告 ↗</a></footer>
+
+    <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+    <aside id="case-drawer" class="case-drawer" aria-hidden="true" aria-label="案例详情">
+      <button id="drawer-close" class="drawer-close" aria-label="关闭详情">×</button>
+      <div id="drawer-content"></div>
+    </aside>
+    <script src="./app.js" defer></script>
+  </body>
+</html>

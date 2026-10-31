@@ -9,15 +9,18 @@
     "api": "node server/index.mjs",
     "dev:all": "node server/index.mjs & vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "verify": "node server/edit-plan.verify.mjs && node server/broll-search.verify.mjs && node server/hyperframes.verify.mjs && node server/render.verify.mjs && node server/music.verify.mjs && node server/video-agent-tools.verify.mjs && node server/video-broll-tools.verify.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@vitejs/plugin-react": "latest",
     "vite": "latest",
     "typescript": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "lucide-react": "latest"
+    "lucide-react": "latest",
+    "zod": "4.5.4"
   },
   "devDependencies": {}
 }

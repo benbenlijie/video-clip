@@ -5,16 +5,18 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { providerState, transcribeVideo } from "./transcription.mjs";
 import { createProjectStore } from "./project-store.mjs";
-import { planWithClaude, validateEditPlan, writeTranscriptArtifacts } from "./edit-plan.mjs";
-import { renderProject } from "./render.mjs";
+import { writeTranscriptArtifacts } from "./edit-plan.mjs";
+import { editWithClaudeCode, editorState } from "./claude-code-editor.mjs";
+import { brollProviderState, searchOnlineBroll } from "./broll-search.mjs";
 
 try {
+  if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
   const envText = await fs.readFile(new URL("../.env", import.meta.url), "utf8");
-  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE"]);
+  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE"]);
   for (const line of envText.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
     if (match && portalKeys.has(match[1])) process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
@@ -22,8 +24,10 @@ try {
 } catch { /* .env is optional. */ }
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const store = createProjectStore(join(root, "storage"));
+const store = createProjectStore(resolve(process.env.WAYNE_STORAGE_DIR || join(root, "storage")));
 const subscribers = new Map();
+const brollSearchRequests = new Map();
+const editorRuntime = editorState();
 await store.loadProjects();
 
 function json(res, status, body) {
@@ -34,24 +38,30 @@ function json(res, status, body) {
 function configState() {
   const transcription = providerState();
   const anthropic = Boolean(process.env.ANTHROPIC_API_KEY || process.env.LLM_ANTHROPIC_API_KEY);
-  const allConfigured = anthropic && transcription.any;
+  const allConfigured = anthropic && transcription.any && editorRuntime.available;
   return {
     anthropic,
+    editor: editorRuntime,
     transcription: transcription.any,
     transcriptionProvider: transcription.provider,
     volcengine: transcription.volcengine,
     tencent: transcription.tencent,
     ffmpeg: true,
+    brollProviders: brollProviderState(),
     mode: allConfigured ? "configured" : anthropic || transcription.any ? "partial" : "demo",
   };
 }
 
 function projectView(project) {
   const media = project.media ? { ...project.media, path: undefined } : project.media;
+  const music = project.music ? { ...project.music, path: undefined } : project.music;
+  const brollAssets = (project.brollAssets || []).map((asset) => ({ ...asset, path: undefined }));
   return {
     ...project,
     dir: undefined,
     media,
+    music,
+    brollAssets,
     config: configState(),
     artifacts: (project.artifacts || []).map((artifact) => ({ ...artifact, url: `/api/projects/${project.id}/artifacts/${encodeURIComponent(artifact.name)}` })),
   };
@@ -62,11 +72,29 @@ function headerNumber(req, name) {
   return Number.isSafeInteger(value) ? value : NaN;
 }
 
+function allowBrollSearch(req) {
+  const now = Date.now();
+  const address = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+  const recent = (brollSearchRequests.get(address) || []).filter((time) => now - time < 60 * 60 * 1000);
+  if (recent.length >= 20) { brollSearchRequests.set(address, recent); return false; }
+  recent.push(now);
+  brollSearchRequests.set(address, recent);
+  if (brollSearchRequests.size > 5000) {
+    for (const [ip, times] of brollSearchRequests) if (!times.some((time) => now - time < 60 * 60 * 1000)) brollSearchRequests.delete(ip);
+    while (brollSearchRequests.size > 5000) brollSearchRequests.delete(brollSearchRequests.keys().next().value);
+  }
+  return true;
+}
+
 async function writeUploadChunk(req, project) {
   const offset = headerNumber(req, "x-upload-offset");
   const totalBytes = headerNumber(req, "x-upload-total");
   const length = headerNumber(req, "x-upload-length");
-  const filename = String(req.headers["x-upload-filename"] || "upload.mp4");
+  let filename = String(req.headers["x-upload-filename"] || "upload.mp4");
+  if (req.headers["x-upload-filename-encoding"] === "uri") {
+    try { filename = decodeURIComponent(filename); }
+    catch { throw Object.assign(new Error("上传文件名编码无效，请重新选择视频"), { statusCode: 400 }); }
+  }
   const maxChunkBytes = 8 * 1024 * 1024;
   const bodyLength = Number.isSafeInteger(length) ? length : headerNumber(req, "content-length");
   if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(totalBytes) || totalBytes <= 0 || !Number.isSafeInteger(bodyLength) || bodyLength <= 0 || bodyLength > maxChunkBytes) {
@@ -129,13 +157,13 @@ async function readJson(req) {
   });
 }
 
-function parseMultipart(req, boundary, destination) {
+function parseMultipart(req, boundary, destination, maxBytes = 500 * 1024 * 1024) {
   return new Promise((resolveUpload, reject) => {
     const chunks = [];
     let totalBytes = 0;
     req.on("data", (chunk) => {
       totalBytes += chunk.length;
-      if (totalBytes > 500 * 1024 * 1024) { reject(new Error("视频文件不能超过 500MB")); req.destroy(); return; }
+      if (totalBytes > maxBytes) { reject(new Error(`上传文件不能超过 ${Math.round(maxBytes / 1024 / 1024)}MB`)); req.destroy(); return; }
       chunks.push(chunk);
     });
     req.on("error", reject);
@@ -158,12 +186,13 @@ function parseMultipart(req, boundary, destination) {
           cursor = Math.max(contentEnd + 2, contentStart);
         }
         const filePart = parts.find((part) => /filename=/i.test(part.header));
-        if (!filePart || filePart.content.length === 0) throw new Error("video file is required");
+        if (!filePart || filePart.content.length === 0) throw new Error("请提供上传文件");
         await fs.writeFile(destination, filePart.content);
         resolveUpload({
           filename: filePart.header.match(/filename="([^"]+)/i)?.[1] || "upload.mp4",
           goal: parts.find((part) => /name="goal"/i.test(part.header))?.content.toString("utf8") || "",
           style: parts.find((part) => /name="style"/i.test(part.header))?.content.toString("utf8") || "",
+          licenseConfirmed: parts.find((part) => /name="licenseConfirmed"/i.test(part.header))?.content.toString("utf8") === "true",
         });
       } catch (error) { reject(error); }
     });
@@ -204,7 +233,7 @@ async function serveFile(req, res, path, contentType, disposition = "inline") {
 
 async function createProject(body = {}) {
   const id = randomUUID();
-  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], media: null, transcript: null, plan: null, qc: null, error: null, upload: null };
+  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, plan: null, qc: null, error: null, upload: null };
   await save(project);
   return project;
 }
@@ -224,20 +253,25 @@ async function transitionToTranscript(project) {
 async function transitionToPlan(project) {
   if (!project.transcript) throw new Error("请先完成转录");
   if (!configState().anthropic) { project.status = "needs_input"; project.error = "未配置 ANTHROPIC_API_KEY，无法生成剪辑计划"; await save(project); throw Object.assign(new Error(project.error), { statusCode: 409, status: project.status }); }
-  project.status = "planning"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude 正在生成剪辑计划" });
+  if (!editorRuntime.available) throw new Error("本机 Claude Code 或媒体隔离工具不可用");
+  project.status = "planning"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code / Opus 5.5 正在检查素材、编写工程并审阅真实预览" });
   try {
-    project.plan = validateEditPlan(await planWithClaude({ transcript: project.transcript, media: project.media, goal: project.goal, style: project.style, comments: project.comments }), project.media.durationMs, { requireVisualEvents: true });
+    const result = await editWithClaudeCode(project, "plan", editorProgress(project));
+    project.plan = result.plan;
+    project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])];
+    project.editor = result.editor;
+    project.artifacts = [...(project.artifacts || []), ...result.artifacts];
+    project.qc = null;
     await fs.writeFile(join(project.dir, "cut-list.json"), JSON.stringify(project.plan, null, 2));
-    project.status = "plan_ready"; await save(project); publish(project.id, { type: "stage", status: project.status, message: "剪辑计划已生成，等待人工确认" });
+    project.status = "plan_ready"; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code 已生成并抽帧审阅预览，等待人工确认" });
   } catch (error) { project.status = "needs_input"; project.error = error.message; await save(project); publish(project.id, { type: "needs_input", status: project.status, message: error.message }); throw Object.assign(error, { statusCode: 502 }); }
 }
 
-async function generateVisualPlan(project) {
-  return validateEditPlan(
-    await planWithClaude({ transcript: project.transcript, media: project.media, goal: project.goal, style: project.style, comments: project.comments }),
-    project.media.durationMs,
-    { requireVisualEvents: true },
-  );
+function editorProgress(project) {
+  return (event) => {
+    project.editor = { ...project.editor, engine: "claude-code", model: editorRuntime.model, activity: [...(project.editor?.activity || []), { at: new Date().toISOString(), ...event }].slice(-12) };
+    publish(project.id, { type: "agent_activity", ...event });
+  };
 }
 
 async function handle(req, res) {
@@ -255,6 +289,76 @@ async function handle(req, res) {
   const project = segments[0] === "api" && segments[1] === "projects" ? store.get(segments[2]) : null;
   if (!project) return json(res, 404, { error: "project not found" });
   if (req.method === "GET" && segments.length === 3) return json(res, 200, projectView(project));
+  if (req.method === "POST" && segments[3] === "broll" && segments[4] === "search") {
+    try {
+      const providers = brollProviderState();
+      if (!providers.pexels && !providers.pixabay) return json(res, 503, { error: "尚未配置 PEXELS_API_KEY 或 PIXABAY_API_KEY", providers });
+      if (!allowBrollSearch(req)) return json(res, 429, { error: "当前 IP 的 B-roll 搜索已达到每小时 20 次限制，请稍后重试" });
+      const body = await readJson(req);
+      const text = String(body.text || project.transcript?.text || project.goal || "");
+      const result = await searchOnlineBroll({ text, orientation: body.orientation || "landscape", cachePath: join(root, "storage", ".broll-search-cache.json") });
+      return json(res, 200, result);
+    } catch (error) {
+      const status = error.statusCode || (/未配置/.test(error.message) ? 503 : /请提供/.test(error.message) ? 400 : 502);
+      return json(res, status, { error: error.message, providers: brollProviderState() });
+    }
+  }
+  if (req.method === "POST" && segments[3] === "music") {
+    const limit = 50 * 1024 * 1024;
+    if (Number(req.headers["content-length"] || 0) > limit) return json(res, 413, { error: "音乐文件不能超过 50MB" });
+    const match = String(req.headers["content-type"] || "").match(/boundary=([^;]+)/i);
+    if (!match) return json(res, 415, { error: "multipart/form-data is required" });
+    const filename = decodeURIComponent(String(req.headers["x-music-filename"] || "music.mp3"));
+    const extension = extname(filename).toLowerCase();
+    if (![".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"].includes(extension)) return json(res, 415, { error: "支持 MP3、WAV、M4A、AAC、OGG 或 FLAC 音频" });
+    if (project.status === "rendering") return json(res, 409, { error: "项目正在渲染，请稍后再上传音乐" });
+    const target = join(project.dir, `music-${randomUUID()}${extension}`);
+    try {
+      const upload = await parseMultipart(req, match[1].replace(/^"|"$/g, ""), target, limit);
+      if (!upload.licenseConfirmed) throw new Error("请先确认你拥有该音乐的使用许可");
+      const metadata = await probeMedia(target);
+      if (!metadata.hasAudio || metadata.hasVideo) throw new Error("请上传纯音频文件作为配乐");
+      project.music = { filename: upload.filename, path: target, licenseConfirmed: true };
+      project.qc = null;
+      project.status = project.plan ? "plan_ready" : project.status;
+      project.error = null;
+      await save(project);
+      publish(project.id, { type: "music", status: project.status, message: "已添加授权配乐" });
+      return json(res, 200, projectView(project));
+    } catch (error) {
+      await fs.rm(target, { force: true }).catch(() => undefined);
+      return json(res, error.statusCode || 400, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && segments[3] === "broll") {
+    const limit = 100 * 1024 * 1024;
+    if (Number(req.headers["content-length"] || 0) > limit) return json(res, 413, { error: "B-roll 视频不能超过 100MB" });
+    const match = String(req.headers["content-type"] || "").match(/boundary=([^;]+)/i);
+    if (!match) return json(res, 415, { error: "multipart/form-data is required" });
+    const filename = decodeURIComponent(String(req.headers["x-broll-filename"] || "broll.mp4"));
+    const extension = extname(filename).toLowerCase();
+    if (![".mp4", ".mov", ".m4v", ".webm"].includes(extension)) return json(res, 415, { error: "B-roll 支持 MP4、MOV、M4V 或 WebM 视频" });
+    if (project.status === "rendering") return json(res, 409, { error: "项目正在渲染，请稍后再上传 B-roll" });
+    const target = join(project.dir, `broll-${randomUUID()}${extension}`);
+    try {
+      const upload = await parseMultipart(req, match[1].replace(/^"|"$/g, ""), target, limit);
+      if (!upload.licenseConfirmed) throw new Error("请先确认你拥有该 B-roll 素材的使用许可");
+      const metadata = await probeMedia(target);
+      if (!metadata.hasVideo || metadata.durationMs <= 0) throw new Error("请上传包含有效画面的 B-roll 视频");
+      const asset = { id: randomUUID(), filename: upload.filename, path: target, durationMs: metadata.durationMs, width: metadata.width, height: metadata.height, licenseConfirmed: true };
+      project.brollAssets = [...(project.brollAssets || []), asset];
+      project.plan = null;
+      project.qc = null;
+      if (project.transcript) project.status = "transcript_ready";
+      project.error = null;
+      await save(project);
+      publish(project.id, { type: "broll", status: project.status, message: "B-roll 素材已保存，重新生成剪辑计划后可供 Claude 选用" });
+      return json(res, 201, projectView(project));
+    } catch (error) {
+      await fs.rm(target, { force: true }).catch(() => undefined);
+      return json(res, error.statusCode || 400, { error: error.message });
+    }
+  }
   if (req.method === "GET" && segments[3] === "events") {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
     const list = subscribers.get(project.id) || []; list.push(res); subscribers.set(project.id, list); res.write(`data: ${JSON.stringify({ type: "snapshot", project: projectView(project) })}\n\n`);
@@ -264,32 +368,17 @@ async function handle(req, res) {
     const name = decodeURIComponent(segments.slice(4).join("/")); const path = store.artifactPath(project, name);
     if (!path) return json(res, 400, { error: "invalid artifact path" });
     if (!(project.artifacts || []).some((artifact) => artifact.name === name)) return json(res, 404, { error: "artifact not found" });
-    try { return serveFile(req, res, path, name.endsWith(".mp4") ? "video/mp4" : name.endsWith(".srt") ? "application/x-subrip" : "application/json", `attachment; filename="${name.replaceAll('"', "")}"`); } catch { return json(res, 404, { error: "artifact not found" }); }
+    const contentType = name.endsWith(".mp4") ? "video/mp4" : name.endsWith(".webm") ? "video/webm" : name.endsWith(".srt") ? "application/x-subrip" : name.endsWith(".html") ? "text/html; charset=utf-8" : name.endsWith(".js") ? "application/javascript" : "application/json";
+    try { return serveFile(req, res, path, contentType, `attachment; filename="${name.replaceAll('"', "")}"`); } catch { return json(res, 404, { error: "artifact not found" }); }
   }
   if (req.method === "POST" && segments[3] === "replan") {
     if (!project.media || !project.transcript) return json(res, 409, { error: "重新生成视觉计划需要已上传素材和转录结果", status: project.status });
     if (["planning", "rendering"].includes(project.status)) return json(res, 409, { error: "当前项目正在处理中，请稍后再试", status: project.status });
     if (!configState().anthropic) return json(res, 409, { error: "未配置 Claude 服务，无法重新生成视觉计划", status: project.status });
-    const previousStatus = project.status;
-    project.status = "planning";
-    project.error = null;
-    await save(project);
-    publish(project.id, { type: "stage", status: project.status, message: "Claude 正在生成可执行视觉剪辑计划" });
     try {
-      const plan = await generateVisualPlan(project);
-      await fs.writeFile(join(project.dir, "cut-list.json"), JSON.stringify(plan, null, 2));
-      project.plan = plan;
-      project.qc = null;
-      project.status = "plan_ready";
-      project.error = null;
-      await save(project);
-      publish(project.id, { type: "stage", status: project.status, message: "视觉剪辑计划已生成，旧版成片已保留" });
+      await transitionToPlan(project);
       return json(res, 200, projectView(project));
     } catch (error) {
-      project.status = previousStatus;
-      project.error = error.message;
-      await save(project);
-      publish(project.id, { type: "replan_failed", status: project.status, message: error.message });
       return json(res, error.statusCode || 502, { error: error.message, status: project.status, project: projectView(project) });
     }
   }
@@ -314,6 +403,7 @@ async function handle(req, res) {
   }
   if (req.method === "POST" && segments[3] === "advance") {
     try {
+      if (["planning", "rendering"].includes(project.status)) throw Object.assign(new Error("Claude Code 正在处理中，请等待本轮完成"), { statusCode: 409 });
       if (project.status === "inspecting" || (project.status === "needs_input" && !project.transcript) || (project.status === "failed" && project.media && !project.transcript)) await transitionToTranscript(project);
       else if (project.status === "failed" && project.plan) { project.status = "preview_ready"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "保留现有计划，可重新渲染" }); }
       else if (project.status === "transcript_ready" || (project.status === "needs_input" && project.transcript && !project.plan) || (project.status === "failed" && project.transcript && !project.plan)) await transitionToPlan(project);
@@ -328,8 +418,10 @@ async function handle(req, res) {
   }
   if (req.method === "POST" && segments[3] === "render") {
     if (!project.plan) return json(res, 409, { error: "请先生成并确认剪辑计划", status: project.status });
-    project.status = "rendering"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "FFmpeg 正在生成主片和 Shorts" });
-    try { const result = await renderProject(project); project.artifacts = [...(project.artifacts || []), ...result.artifacts]; project.qc = result.qc; project.status = "completed"; await save(project); publish(project.id, { type: "stage", status: project.status, message: "视觉编辑渲染和 QC 已完成" }); return json(res, 200, projectView(project)); } catch (error) { project.status = "failed"; project.error = error.message; await save(project); publish(project.id, { type: "failed", status: project.status, message: error.message }); return json(res, 502, { error: error.message, status: project.status }); }
+    if (["planning", "rendering"].includes(project.status)) return json(res, 409, { error: "Claude Code 正在处理中，请等待本轮完成" });
+    if (project.editor?.engine !== "claude-code" || !project.editor.runId) return json(res, 409, { error: "这是旧版模板计划，请先重新生成 Claude Code 工程和预览", status: project.status });
+    project.status = "rendering"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code / Opus 5.5 正在执行工程、审片并修正" });
+    try { const result = await editWithClaudeCode(project, "render", editorProgress(project)); project.plan = result.plan; project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])]; project.editor = result.editor; project.artifacts = [...(project.artifacts || []), ...result.artifacts]; project.qc = result.qc; project.status = "completed"; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code 已导出并抽帧审阅，请观看成片验收" }); return json(res, 200, projectView(project)); } catch (error) { project.status = "failed"; project.error = error.message; await save(project); publish(project.id, { type: "failed", status: project.status, message: error.message }); return json(res, 502, { error: error.message, status: project.status }); }
   }
   return json(res, 404, { error: "route not found" });
 }

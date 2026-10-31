@@ -12,16 +12,16 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 1. `brief.json`：本轮目标、风格、批注和媒体信息；
 2. `transcript.json`：逐词或逐句时间戳；
 3. `assets.json`：已授权的 B-roll 和配乐；
-4. `references/public-skill-audit.md`：公开 Skill 的来源与采用边界；
-5. `references/editorial-grammar.md`：Wayne/Cutline 编辑语法、镜头角色、字幕、声音和品牌令牌；
-6. `references/verification.md`：预览与终稿验证门禁。
+4. `.claude/skills/video-edit/references/public-skill-audit.md`：公开 Skill 的来源与采用边界；
+5. `.claude/skills/video-edit/references/editorial-grammar.md`：Wayne/Cutline 编辑语法、镜头角色、字幕、声音和品牌令牌；
+6. `.claude/skills/video-edit/references/verification.md`：预览与终稿验证门禁。
 
 这些规则吸收了公开的 MIT/Apache-2.0 项目经验，但不复制它们的品牌、字体、模板或外部素材流程。当前工作区的输入输出、MCP 工具和服务器 QC 是最终契约。
 
 ## 工具与隔离环境
 
 - `mcp__video__execute`：离线 Linux shell。可写目录只有 `/work`；FFmpeg、FFprobe、Python、Node 和已安装的 HyperFrames 可用。禁止安装包、访问任意外网或读取工作区外文件。
-- `mcp__video__search_broll`：只有在真实素材和转录证明需要补充画面时才调用；一次最多规划 1–3 个具体场景意图。
+- `mcp__video__search_broll`：对 9:16 口播默认先评估 1–3 个具体场景意图。没有产品 UI 时，仍可使用与口播语义匹配的通用剪辑、工作流、键盘、素材整理等画面；只有会误导事实或没有任何视觉增量时才跳过。
 - `mcp__video__view_broll_candidate`：下载前必须查看候选缩略图和许可信息。
 - `mcp__video__download_broll`：只下载紧接着搜索得到并审查过的候选；一轮最多 3 个。任何 `brollEvents` 只能引用实际下载的素材。
 - `mcp__video__write_file` / `mcp__video__read_file`：管理脚本、字幕、HyperFrames 源码、计划和报告。
@@ -37,7 +37,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 ### 2. 建立 beat map
 
-先按 `references/editorial-grammar.md` 写出内部 beat map：`hook`、`teaser`、`context`、`proof`、`payoff`、`brand`、`cta`，并为每段选择 `FULL`、`PUNCH_IN`、`SPLIT`、`BROLL_COVER` 或 `TEASER` 镜头角色。节奏由语义和能量决定，禁止机械地每秒切一次。
+先按 `.claude/skills/video-edit/references/editorial-grammar.md` 写出内部 beat map：`hook`、`teaser`、`context`、`proof`、`payoff`、`brand`、`cta`，并为每段选择 `FULL`、`PUNCH_IN`、`SPLIT`、`BROLL_COVER` 或 `TEASER` 镜头角色。节奏由语义和能量决定，禁止机械地每秒切一次。
 
 然后写入当前门户契约的 `edit-plan.json`：
 
@@ -60,6 +60,9 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - 进入动画至少同时改变透明度、位移或缩放中的两项；列表和字幕要错峰进入；退出通常比进入更快。
 - 所有时间由 `fps` 和真实时间戳推导，禁止随机数、当前时间和运行时网络请求。
 - 统一使用项目令牌：`#f1f3ea`（ink）、`#c6f475`（mint）、`#f58c53`（orange）、`#111311`（panel）。新颜色、字体和动效先写入项目说明。
+- 竖屏 9:16 画面必须优先为手机观看设计：关键文字放在中间 70% 安全区；标题卡不超过画面高度约 22%，持续 0.8–2.5 秒；每个字幕组 1–4 个词或一行短语；不要让大段文字长期覆盖头顶或胸口。
+- 9:16 口播至少安排两类画面变化：`PUNCH_IN` 加 `BROLL_COVER`/`SPLIT`/`HyperFrames` 动效中的至少一类。每 8–15 秒应有一次可解释的视觉变化，但不要把所有变化都做成同一种卡片。
+- HyperFrames 不是可选装饰：在可用时至少制作一个 Hook、重点或转场动效，并在 `manifest.sources` 和 `manifest.review.notes` 中列出实际执行的动效源与审片时间。
 - 人脸特写字幕放在胸口或安全带，通常 1–2 行；不能遮挡眼睛、嘴或屏幕关键内容。不要同时显示内容完全重复的标题和字幕。
 - A-roll 是声音骨架；B-roll 覆盖画面但不能改变口播事实。B-roll 必须有来源、许可和最终审片帧。
 - 配乐必须低于人声并自动 duck。可使用 `ffmpeg` 合成短 SFX；最终目标参考为约 `-16 LUFS`、真峰值不高于 `-1.5 dBTP`，噪声被放大时要写入限制。
@@ -76,7 +79,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - 一个 Hook 或 teaser；
 - 一个结尾或 CTA（若真实存在）。
 
-运行 `node scripts/verify-render.mjs preview.mp4`（必要时传入宽高和时长约束），然后修复发现的问题。写入：
+运行 `node .claude/skills/video-edit/scripts/verify-render.mjs preview.mp4`（必要时传入宽高和时长约束），然后修复发现的问题。写入：
 
 ```json
 {
@@ -86,6 +89,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
   "sources": ["edit.py", "captions.ass"],
   "shorts": [],
   "broll": [{"assetId":"...","startMs":0,"endMs":1000,"sourceStartMs":0,"reviewTimeSeconds":1.2}],
+  "hyperframes": {"rendered": true, "source": "overlay/index.html", "reviewTimeSeconds": 1.2},
   "review": {"passed": true, "notes": "实际检查了什么、仍有哪些限制"}
 }
 ```
@@ -104,6 +108,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
   "sources": ["edit.py", "captions.ass", "edit-report.md"],
   "shorts": [{"path":"short-01.mp4","title":"...","slot":1}],
   "broll": [],
+  "hyperframes": {"rendered": true, "source": "overlay/index.html", "reviewTimeSeconds": 1.2},
   "review": {"passed": true, "notes": "实际视觉检查、音频检查和限制"}
 }
 ```

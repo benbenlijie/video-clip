@@ -28,17 +28,23 @@ function agentEnvironment() {
   return env;
 }
 
-async function prepareWorkspace(project, phase) {
+export async function prepareWorkspace(project, phase, options = {}) {
   const projectDir = resolve(project.dir);
   const runsRoot = join(projectDir, "agent-runs");
   await fs.mkdir(runsRoot, { recursive: true });
-  const runId = phase === "render" || (phase === "plan" && project.editor?.runId) ? project.editor.runId : randomUUID();
+  const runId = ["render", "chat-edit"].includes(phase) || (phase === "plan" && project.editor?.runId) ? project.editor.runId : randomUUID();
   if (!runId || !/^[a-f0-9-]{36}$/.test(runId)) throw new Error("请先让 Claude Code 生成并审阅预览，再导出成片");
   const dir = join(runsRoot, runId);
   await fs.mkdir(dir, { recursive: true });
-  if (phase === "plan" && !project.editor?.runId) {
-    await fs.copyFile(project.media.path, join(dir, "input.mp4"), fsConstants.COPYFILE_FICLONE);
-    await fs.cp(join(root, "agent-skills/video-edit"), join(dir, ".claude/skills/video-edit"), { recursive: true });
+  const skillRoot = join(dir, ".claude", "skills", "video-edit");
+  // Always refresh the project adapter before a planning/replan turn. Existing
+  // workspaces otherwise keep stale skill instructions after an upgrade.
+  if (phase === "plan" || options.refreshSkill) {
+    await fs.rm(skillRoot, { recursive: true, force: true });
+    await fs.cp(join(root, "agent-skills/video-edit"), skillRoot, { recursive: true });
+  }
+  if (phase === "plan") {
+    if (!project.editor?.runId) await fs.copyFile(project.media.path, join(dir, "input.mp4"), fsConstants.COPYFILE_FICLONE);
     for (const skill of ["hyperframes", "hyperframes-cli"]) {
       // Prefer installed skills, without installing or changing global Claude configuration.
       const installed = join(process.env.HOME || "/home/ben", ".agents/skills", skill);
@@ -47,26 +53,35 @@ async function prepareWorkspace(project, phase) {
     const assets = [];
     for (const [index, asset] of (project.brollAssets || []).entries()) {
       const name = `broll-${index + 1}${extname(asset.path) || ".mp4"}`;
+      await fs.rm(join(dir, name), { force: true });
       await fs.copyFile(asset.path, join(dir, name), fsConstants.COPYFILE_FICLONE);
       assets.push({ id: asset.id, filename: asset.filename, path: name, licenseConfirmed: asset.licenseConfirmed });
     }
-    if (project.music?.path) await fs.copyFile(project.music.path, join(dir, `music${extname(project.music.path)}`), fsConstants.COPYFILE_FICLONE);
+    if (project.music?.path) {
+      const musicName = `music${extname(project.music.path)}`;
+      await fs.rm(join(dir, musicName), { force: true });
+      await fs.copyFile(project.music.path, join(dir, musicName), fsConstants.COPYFILE_FICLONE);
+    }
     await fs.writeFile(join(dir, "assets.json"), JSON.stringify({ broll: assets, music: project.music ? { path: `music${extname(project.music.path)}`, licenseConfirmed: project.music.licenseConfirmed } : null }, null, 2));
   }
   await fs.writeFile(join(dir, "transcript.json"), JSON.stringify(project.transcript, null, 2));
-  await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: phase === "render" ? project.plan : undefined }, null, 2));
+  await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: ["render", "chat-edit"].includes(phase) ? project.plan : undefined, chatTurn: options.chatTurn || undefined, chatContext: options.chatContext || undefined, latestVersion: project.editSession?.latestVersion || project.editor?.version || 1 }, null, 2));
   return { dir, runId };
 }
 
-export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetUsd = phase === "plan" ? 4 : 6, timeoutMs = 12 * 60000 }) {
+export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetUsd = phase === "plan" ? 4 : 6, timeoutMs = 12 * 60000, sessionId = null, resume = false }) {
   await fs.mkdir(controlDir(dir), { recursive: true });
   const auditPath = join(controlDir(dir), `tools-${phase}.jsonl`);
   const configPath = join(controlDir(dir), `mcp-${phase}.json`);
   await fs.writeFile(auditPath, "");
   const toolEnv = { PATH: process.env.PATH, HOME: process.env.HOME || "/home/ben", PEXELS_API_KEY: process.env.PEXELS_API_KEY || "", PIXABAY_API_KEY: process.env.PIXABAY_API_KEY || "" };
   await fs.writeFile(configPath, JSON.stringify({ mcpServers: { video: { command: process.execPath, args: [join(root, "server/video-agent-tools.mjs"), dir, auditPath], env: toolEnv } } }));
-  const prompt = `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file, then read references/public-skill-audit.md, references/editorial-grammar.md, references/verification.md, brief.json, transcript.json and assets.json. Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Implement the edit yourself; do not just describe a plan. Read the HyperFrames skill when using that tool. Run scripts/verify-render.mjs on the preview or final when applicable. End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
-  const args = ["--bare", "--restricted", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", configPath, "--model", EDITOR_MODEL, "--effort", "high", "--permission-mode", "dontAsk", "--tools", "Read,Skill", "--allowedTools", "Read,Skill,mcp__video__*", "--max-budget-usd", String(budgetUsd), "--no-session-persistence", "--output-format", "stream-json", "--verbose", "--print", prompt];
+  const prompt = buildEditorPrompt(phase);
+  const args = ["--bare", "--restricted", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", configPath, "--model", EDITOR_MODEL, "--effort", "high", "--permission-mode", "dontAsk", "--tools", "Read,Skill", "--allowedTools", "Read,Skill,mcp__video__*", "--max-budget-usd", String(budgetUsd)];
+  if (resume && sessionId) args.push("--resume", sessionId);
+  else if (sessionId) args.push("--session-id", sessionId);
+  if (phase !== "chat-edit") args.push("--no-session-persistence");
+  args.push("--output-format", "stream-json", "--verbose", "--print", prompt);
   let result;
   const models = new Set();
   const events = [];
@@ -98,12 +113,17 @@ export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetU
   return receipt;
 }
 
+export function buildEditorPrompt(phase) {
+  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, transcript.json and assets.json. Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Implement the edit yourself; do not just describe a plan. Read the HyperFrames skill when using that tool. Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Use HyperFrames for at least one executable animated overlay or transition in every plan when the runtime is available. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
+}
+
 export async function validateAgentOutput(dir, phase) {
   const manifest = JSON.parse(await fs.readFile(await workspacePath(dir, "manifest.json"), "utf8"));
   if (manifest.phase !== phase || manifest.review?.passed !== true || typeof manifest.review.notes !== "string" || !manifest.review.notes.trim()) throw new Error("缺少真实阶段产物或视觉审查说明");
   const mainPath = await workspacePath(dir, manifest.main);
   if (extname(mainPath) !== ".mp4") throw new Error("主视频必须是 MP4");
   const probe = await probeOutput(mainPath);
+  const brief = JSON.parse(await fs.readFile(await workspacePath(dir, "brief.json"), "utf8"));
   const hash = createHash("sha256").update(await fs.readFile(mainPath)).digest("hex");
   const audit = (await fs.readFile(join(controlDir(dir), `tools-${phase}.jsonl`), "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const frames = audit.filter((event) => event.tool === "view_frame" && event.video === manifest.main && event.sha256 === hash && !event.error);
@@ -116,9 +136,18 @@ export async function validateAgentOutput(dir, phase) {
   if (!Array.isArray(manifest.sources) || !manifest.sources.length) throw new Error("缺少可编辑工程源码");
   const subtitle = await workspacePath(dir, manifest.subtitle);
   if (extname(subtitle) !== ".srt" || !(await fs.readFile(subtitle, "utf8")).includes("-->")) throw new Error("缺少最终时间线字幕");
-  const files = [{ path: manifest.main, kind: phase === "plan" ? "preview" : "video", ...probe }, { path: manifest.subtitle, kind: "subtitle" }];
+  const files = [{ path: manifest.main, kind: ["plan", "chat-edit"].includes(phase) ? "preview" : "video", ...probe }, { path: manifest.subtitle, kind: "subtitle" }];
   const brollAudit = (await fs.readFile(join(controlDir(dir), "broll-audit.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const downloaded = new Map(brollAudit.filter((entry) => entry.tool === "download_broll").map((entry) => [entry.assetId, entry]));
+  const hyperframesSource = (manifest.sources || []).find((source) => /hyperframes|\.html$/i.test(source));
+  const hyperframesExecuted = audit.some((event) => event.tool === "execute" && /hyperframes/i.test(String(event.command || "")));
+  if (["plan", "render", "chat-edit"].includes(phase) && probe.height > probe.width && (!manifest.hyperframes?.rendered || !hyperframesSource || !hyperframesExecuted)) {
+    throw new Error("竖屏预览必须包含实际执行并审片的 HyperFrames 动效");
+  }
+  const providersConfigured = Boolean(process.env.PEXELS_API_KEY || process.env.PIXABAY_API_KEY);
+  if (phase === "plan" && probe.height > probe.width && probe.durationMs >= 15000 && providersConfigured && (!Array.isArray(manifest.broll) || manifest.broll.length === 0)) {
+    throw new Error("当前已配置 B-roll 提供商，竖屏长口播至少需要一段经过审查的 B-roll");
+  }
   for (const event of Array.isArray(manifest.broll) ? manifest.broll : []) {
     if (!downloaded.has(event.assetId)) throw new Error(`B-roll ${event.assetId} 没有对应下载证据`);
     const reviewTime = Number(event.reviewTimeSeconds);
@@ -132,7 +161,7 @@ export async function validateAgentOutput(dir, phase) {
     await workspacePath(dir, source); files.push({ path: source, kind: "source" });
   }
   for (const short of manifest.shorts || []) {
-    if (phase !== "render" || !Number.isInteger(short.slot) || short.slot < 1 || short.slot > 5) throw new Error("Shorts 清单无效");
+    if (!["render", "chat-edit"].includes(phase) || !Number.isInteger(short.slot) || short.slot < 1 || short.slot > 5) throw new Error("Shorts 清单无效");
     const path = await workspacePath(dir, short.path);
     const shortProbe = await probeOutput(path);
     if (shortProbe.width !== 1080 || shortProbe.height !== 1920) throw new Error("Shorts 必须为 1080×1920");
@@ -166,12 +195,20 @@ export async function saveAgentOutput(project, phase, dir, runId, receipt) {
   return { plan, artifacts, brollAssets: persistedBrollAssets, qc, editor: { engine: "claude-code", model: EDITOR_MODEL, runId, version, phase, sessionId: receipt.sessionId, costUsd: receipt.costUsd } };
 }
 
-export async function editWithClaudeCode(project, phase, onEvent) {
+export async function editWithClaudeCode(project, phase, onEvent, options = {}) {
   if (activeProjects.has(project.id)) throw Object.assign(new Error("当前项目已有 Claude Code 会话在执行"), { statusCode: 409 });
   activeProjects.add(project.id);
   try {
-    const { dir, runId } = await prepareWorkspace(project, phase);
-    const receipt = await invokeClaudeCode({ dir, phase, onEvent });
+    const { dir, runId } = await prepareWorkspace(project, phase, options);
+    // Persist the workspace identity before starting Claude Code. A timeout can
+    // happen after files were written but before saveAgentOutput returns; the
+    // next retry must still be able to reopen this exact workspace.
+    if (phase === "plan" && project.editor?.runId !== runId) {
+      project.editor = { ...project.editor, engine: "claude-code", model: EDITOR_MODEL, runId, phase };
+      if (typeof options.persistProject === "function") await options.persistProject(project);
+    }
+    const chatSessionId = phase === "chat-edit" ? (options.sessionId || randomUUID()) : null;
+    const receipt = await invokeClaudeCode({ dir, phase, onEvent, sessionId: chatSessionId, resume: Boolean(options.sessionId) });
     return await saveAgentOutput(project, phase, dir, runId, receipt);
   } finally { activeProjects.delete(project.id); }
 }

@@ -53,7 +53,7 @@ export function registerBrollTools(server, { workspaceDir, auditPath, cachePath,
   const audit = auditWriter(auditPath);
   let downloadCount = 0;
   server.registerTool("search_broll", {
-    description: "Search Pexels/Pixabay for concrete B-roll scenes. Use only when the edit genuinely benefits from supplemental footage. Return 1-3 scene intents with 1-2 concise English queries each. Results are visual candidates, not yet used in the timeline.",
+    description: "Search Pexels/Pixabay for concrete B-roll scenes. For portrait talking-head edits, evaluate B-roll by default and use it when it adds visual information; absence of product UI is not a reason to skip relevant generic footage. Return 1-3 scene intents with 1-2 concise English queries each. Results are visual candidates, not yet used in the timeline.",
     inputSchema: { scenes: z.array(z.object({ id: z.string().min(1).max(48), visualIntent: z.string().min(4).max(180), queries: z.array(z.string().min(2).max(100)).min(1).max(2) }).strict()).min(1).max(3), orientation: z.enum(["landscape", "portrait", "square"]).default("portrait") },
   }, async ({ scenes, orientation }) => {
     const result = await searchBrollScenes({ scenes, orientation, cachePath, fetchImpl });

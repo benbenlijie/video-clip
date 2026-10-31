@@ -89,9 +89,17 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 - `GET /api/projects/:id/events`：SSE 状态流；
 - `POST /api/projects/:id/advance`：推进阶段，转录阶段调用火山引擎，失败后自动尝试腾讯云；
 - `POST /api/projects/:id/replan`：在现有工程和批注基础上重新启动 Claude Code / Opus 5.5，制作修订预览并视觉审查；
+- `GET /api/projects/:id/chat`：读取当前项目的多轮对话编辑会话、消息和版本历史；
+- `POST /api/projects/:id/chat/messages`：把一条自然语言修改请求加入当前会话；请求立即返回，后台基于最新成功版本运行 Claude Code，并通过项目 SSE 推送 `chat_started`、`chat_completed` 或 `chat_failed`；
 - `POST /api/projects/:id/comments`：保存时间戳批注。
 - `POST /api/projects/:id/render`：继续同一个 Opus 5.5 剪辑工程，按批注生成终稿、短视频（适合时）和字幕，逐帧检查并修正。服务端独立检查真实审片帧、音视频流与同步、持续黑帧、白名单路径和导出分辨率；失败不会标记为 `completed`。
 - `GET /api/projects/:id/artifacts/:name`：下载项目白名单产物。
+
+### 多轮对话调整
+
+导出首个版本后，可以进入“对话调整”工作台继续修改。每条消息都默认基于最近一次 QC 通过的版本，生成新的版本号（例如 v1 → v2 → v3）；历史视频和工程产物不会被覆盖。发送请求时可以附带 `timeMs` 和 `rangeEndMs`，界面会把它们显示为本轮修改范围。
+
+对话会话保存在项目的 `editSession` 中，编辑工作区会复用同一份 Claude Code 工程并保存每轮的输入、会话 ID、审片证据和 QC。只有新版本通过 QC 才会推进 `latestVersion`；失败时上一版仍然是当前可编辑版本。前端的“查看版本”只切换播放内容，下一轮修改仍以页面明确显示的最新版本为基准。
 
 上传接口限制单文件 500MB；原始 MP4 和成片路由支持 HTTP Range，浏览器可以拖动预览。健康接口只返回服务能力状态，不暴露项目数量或密钥。
 

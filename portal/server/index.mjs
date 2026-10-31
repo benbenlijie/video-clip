@@ -12,6 +12,7 @@ import { createProjectStore } from "./project-store.mjs";
 import { writeTranscriptArtifacts } from "./edit-plan.mjs";
 import { editWithClaudeCode, editorState } from "./claude-code-editor.mjs";
 import { brollProviderState, searchOnlineBroll } from "./broll-search.mjs";
+import { appendEditTurn, buildChatContext, completeEditTurn, createEditSession, failEditTurn } from "./edit-chat.mjs";
 
 try {
   if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
@@ -64,6 +65,25 @@ function projectView(project) {
     brollAssets,
     config: configState(),
     artifacts: (project.artifacts || []).map((artifact) => ({ ...artifact, url: `/api/projects/${project.id}/artifacts/${encodeURIComponent(artifact.name)}` })),
+  };
+}
+
+function projectSummary(project) {
+  const latestVersion = project.editSession?.latestVersion || project.editor?.version || project.qc?.version || 1;
+  return {
+    id: project.id,
+    status: project.status,
+    goal: project.goal,
+    style: project.style,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+    error: project.error,
+    media: project.media ? { filename: project.media.filename, durationMs: project.media.durationMs, width: project.media.width, height: project.media.height } : null,
+    latestVersion,
+    hasTranscript: Boolean(project.transcript),
+    hasPlan: Boolean(project.plan),
+    hasPreview: Boolean((project.artifacts || []).some((artifact) => artifact.kind === "preview")),
+    hasFinal: Boolean((project.artifacts || []).some((artifact) => artifact.kind === "video")),
   };
 }
 
@@ -140,6 +160,19 @@ async function save(project) {
   project.updatedAt = new Date().toISOString();
   return store.saveProject(project);
 }
+
+async function recoverInterruptedChatEdits() {
+  for (const project of store.projects.values()) {
+    if (project.status !== "chat_editing") continue;
+    const runningTurn = project.editSession?.turns?.find((turn) => turn.status === "running");
+    if (runningTurn && project.editSession) project.editSession = failEditTurn(project.editSession, runningTurn.id, "服务在本轮完成前重启，请重新发送修改要求");
+    project.status = "chat_ready";
+    project.error = "上一轮对话修改在服务重启前未完成，当前版本未改变，可以重新发送修改要求";
+    await save(project);
+  }
+}
+
+await recoverInterruptedChatEdits();
 
 function publish(projectId, event) {
   const project = store.get(projectId);
@@ -233,7 +266,7 @@ async function serveFile(req, res, path, contentType, disposition = "inline") {
 
 async function createProject(body = {}) {
   const id = randomUUID();
-  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, plan: null, qc: null, error: null, upload: null };
+  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, plan: null, qc: null, error: null, upload: null, editSession: null };
   await save(project);
   return project;
 }
@@ -256,7 +289,7 @@ async function transitionToPlan(project) {
   if (!editorRuntime.available) throw new Error("本机 Claude Code 或媒体隔离工具不可用");
   project.status = "planning"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code / Opus 5.5 正在检查素材、编写工程并审阅真实预览" });
   try {
-    const result = await editWithClaudeCode(project, "plan", editorProgress(project));
+    const result = await editWithClaudeCode(project, "plan", editorProgress(project), { persistProject: save });
     project.plan = result.plan;
     project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])];
     project.editor = result.editor;
@@ -274,11 +307,46 @@ function editorProgress(project) {
   };
 }
 
+function ensureEditSession(project) {
+  const session = createEditSession(project);
+  project.editSession = session;
+  return session;
+}
+
+async function runChatEdit(project, turn) {
+  try {
+    const session = ensureEditSession(project);
+    const result = await editWithClaudeCode(project, "chat-edit", editorProgress(project), { chatTurn: turn, chatContext: buildChatContext(session), sessionId: session.sessionId });
+    project.plan = result.plan;
+    project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])];
+    project.editor = { ...result.editor, version: turn.resultVersion, phase: "chat-edit", sessionId: result.editor.sessionId || session.sessionId };
+    project.artifacts = [...(project.artifacts || []), ...result.artifacts];
+    project.qc = result.qc;
+    project.editSession = completeEditTurn(project.editSession, turn.id, { resultVersion: turn.resultVersion, sessionId: result.editor.sessionId, assistantText: `已生成 v${turn.resultVersion} 预览，QC 已通过。你可以继续对话修改，或确认导出正式成片。` });
+    project.status = "chat_ready";
+    project.error = null;
+    await fs.writeFile(join(project.dir, "cut-list.json"), JSON.stringify(project.plan, null, 2));
+    await save(project);
+    publish(project.id, { type: "chat_completed", status: project.status, message: `对话修改完成，已生成 v${turn.resultVersion}` });
+  } catch (error) {
+    project.editSession = failEditTurn(project.editSession, turn.id, error.message);
+    project.status = "chat_ready";
+    project.error = error.message;
+    await save(project);
+    publish(project.id, { type: "chat_failed", status: project.status, message: error.message });
+  }
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const segments = url.pathname.split("/").filter(Boolean);
   if (req.method === "GET" && url.pathname === "/api/health") return json(res, 200, { ok: true, service: "wayne-portal", config: configState() });
   if (req.method === "GET" && url.pathname === "/api/config") return json(res, 200, configState());
+  if (req.method === "GET" && url.pathname === "/api/projects") {
+    const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+    const projects = [...store.projects.values()].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""))).slice(0, limit).map(projectSummary);
+    return json(res, 200, { projects });
+  }
   if (req.method === "POST" && url.pathname === "/api/projects") { try { return json(res, 201, projectView(await createProject(await readJson(req)))); } catch (error) { return json(res, 400, { error: error.message }); } }
 
   if (req.method === "GET" && segments[0] === "media" && segments[1] && ["input.mp4", "transcript-audio.wav"].includes(segments[2])) {
@@ -415,6 +483,26 @@ async function handle(req, res) {
   }
   if (req.method === "POST" && segments[3] === "comments") {
     try { const body = await readJson(req); const text = String(body.text || "").trim(); if (!text) throw new Error("批注内容不能为空"); project.comments = [...(project.comments || []), { id: randomUUID(), timeMs: Math.max(0, Number(body.timeMs) || 0), text, createdAt: new Date().toISOString() }]; project.status = "awaiting_revision"; await save(project); publish(project.id, { type: "comment", comment: project.comments.at(-1), status: project.status }); return json(res, 201, projectView(project)); } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+  if (req.method === "GET" && segments[3] === "chat") {
+    return json(res, 200, projectView({ ...project, editSession: ensureEditSession(project) }));
+  }
+  if (req.method === "POST" && segments[3] === "chat" && segments[4] === "messages") {
+    if (!project.media || !project.transcript || !project.editor?.runId || !project.plan) return json(res, 409, { error: "请先完成一次 Claude Code 剪辑并生成可编辑版本", status: project.status });
+    if (["planning", "rendering", "chat_editing"].includes(project.status)) return json(res, 409, { error: "当前已有编辑任务正在执行，请稍后再试", status: project.status });
+    if (!configState().anthropic || !editorRuntime.available) return json(res, 409, { error: "Claude Code 服务当前不可用", status: project.status });
+    try {
+      const body = await readJson(req);
+      const session = ensureEditSession(project);
+      const appended = appendEditTurn(session, { text: body.text, timeMs: body.timeMs, rangeEndMs: body.rangeEndMs, baseVersion: session.latestVersion });
+      project.editSession = appended.session;
+      project.status = "chat_editing";
+      project.error = null;
+      await save(project);
+      publish(project.id, { type: "chat_started", status: project.status, message: `正在基于 v${appended.turn.baseVersion} 生成 v${appended.turn.resultVersion}` });
+      void runChatEdit(project, appended.turn);
+      return json(res, 202, projectView(project));
+    } catch (error) { return json(res, error.statusCode || 400, { error: error.message, status: project.status }); }
   }
   if (req.method === "POST" && segments[3] === "render") {
     if (!project.plan) return json(res, 409, { error: "请先生成并确认剪辑计划", status: project.status });

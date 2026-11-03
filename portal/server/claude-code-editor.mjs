@@ -1,4 +1,5 @@
 import { promises as fs, constants as fsConstants } from "node:fs";
+import { createReadStream } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -9,8 +10,15 @@ import { workspacePath } from "./video-agent-tools.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const EDITOR_MODEL = "claude-opus-5-5";
+export const EDITOR_SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const activeProjects = new Set();
 const controlDir = (dir) => join(dirname(dir), `.control-${basename(dir)}`);
+
+async function sha256File(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
 
 export function editorState() {
   return { engine: "claude-code", model: EDITOR_MODEL, available: spawnSync("claude", ["--version"], { timeout: 5000, encoding: "utf8" }).status === 0 && spawnSync("bwrap", ["--version"], { timeout: 3000 }).status === 0 };
@@ -55,7 +63,7 @@ export async function prepareWorkspace(project, phase, options = {}) {
       const name = `broll-${index + 1}${extname(asset.path) || ".mp4"}`;
       await fs.rm(join(dir, name), { force: true });
       await fs.copyFile(asset.path, join(dir, name), fsConstants.COPYFILE_FICLONE);
-      assets.push({ id: asset.id, filename: asset.filename, path: name, licenseConfirmed: asset.licenseConfirmed });
+      assets.push({ id: asset.id, filename: asset.filename, path: name, durationMs: asset.durationMs, width: asset.width, height: asset.height, licenseConfirmed: asset.licenseConfirmed, licenseName: asset.licenseName, licenseUrl: asset.licenseUrl, sourceUrl: asset.sourceUrl, sha256: asset.sha256 });
     }
     if (project.music?.path) {
       const musicName = `music${extname(project.music.path)}`;
@@ -65,11 +73,11 @@ export async function prepareWorkspace(project, phase, options = {}) {
     await fs.writeFile(join(dir, "assets.json"), JSON.stringify({ broll: assets, music: project.music ? { path: `music${extname(project.music.path)}`, licenseConfirmed: project.music.licenseConfirmed } : null }, null, 2));
   }
   await fs.writeFile(join(dir, "transcript.json"), JSON.stringify(project.transcript, null, 2));
-  await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: ["render", "chat-edit"].includes(phase) ? project.plan : undefined, chatTurn: options.chatTurn || undefined, chatContext: options.chatContext || undefined, latestVersion: project.editSession?.latestVersion || project.editor?.version || 1 }, null, 2));
+  await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, projectId: project.id, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: ["render", "chat-edit"].includes(phase) ? project.plan : undefined, chatTurn: options.chatTurn || undefined, chatContext: options.chatContext || undefined, latestVersion: project.editSession?.latestVersion || project.editor?.version || 1 }, null, 2));
   return { dir, runId };
 }
 
-export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetUsd = phase === "plan" ? 4 : 6, timeoutMs = 12 * 60000, sessionId = null, resume = false }) {
+export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetUsd = phase === "plan" ? 4 : 6, timeoutMs = EDITOR_SESSION_TIMEOUT_MS, sessionId = null, resume = false }) {
   await fs.mkdir(controlDir(dir), { recursive: true });
   const auditPath = join(controlDir(dir), `tools-${phase}.jsonl`);
   const configPath = join(controlDir(dir), `mcp-${phase}.json`);
@@ -114,7 +122,10 @@ export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetU
 }
 
 export function buildEditorPrompt(phase) {
-  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, transcript.json and assets.json. Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Implement the edit yourself; do not just describe a plan. Read the HyperFrames skill when using that tool. Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Use HyperFrames for at least one executable animated overlay or transition in every plan when the runtime is available. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
+  const remotionInstruction = ["plan", "chat-edit"].includes(phase)
+    ? "After edit-plan.json is stable, use mcp__video__render_remotion_preview for one comparison render when the Remotion runtime is available. Inspect at least two moments in its returned preview with mcp__video__view_frame. Use a second comparison render only after changing visualEvents. This is a separate design comparison; do not claim it is the normal Wayne preview or final export. If the tool fails, record the reason and continue with the standard Wayne preview."
+    : "Do not create an additional Remotion comparison during the final export phase.";
+  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, transcript.json and assets.json. Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Implement the edit yourself; do not just describe a plan. Read the HyperFrames skill when using that tool. Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Use HyperFrames for at least one executable animated overlay or transition in every plan when the runtime is available. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. ${remotionInstruction} End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
 }
 
 export async function validateAgentOutput(dir, phase) {
@@ -137,6 +148,22 @@ export async function validateAgentOutput(dir, phase) {
   const subtitle = await workspacePath(dir, manifest.subtitle);
   if (extname(subtitle) !== ".srt" || !(await fs.readFile(subtitle, "utf8")).includes("-->")) throw new Error("缺少最终时间线字幕");
   const files = [{ path: manifest.main, kind: ["plan", "chat-edit"].includes(phase) ? "preview" : "video", ...probe }, { path: manifest.subtitle, kind: "subtitle" }];
+  const currentPlanSha256 = await sha256File(await workspacePath(dir, "edit-plan.json"));
+  const currentSourceSha256 = await sha256File(await workspacePath(dir, "input.mp4"));
+  const remotionComparisons = [];
+  for (const entry of audit.filter((event) => event.tool === "render_remotion_preview" && !event.error)) {
+    if (entry.editPlanSha256 !== currentPlanSha256 || entry.sourceMediaSha256 !== currentSourceSha256) {
+      remotionComparisons.push({ status: "stale", remotionVersion: entry.remotionVersion });
+      continue;
+    }
+    const previewPath = await workspacePath(dir, entry.previewPath);
+    const previewSha256 = await sha256File(previewPath);
+    if (previewSha256 !== entry.sha256?.preview || entry.qc?.passed !== true) throw new Error("Remotion 对照预览的哈希或 QC 记录无效");
+    const reviewFrames = audit.filter((event) => event.tool === "view_frame" && event.video === entry.previewPath && event.sha256 === previewSha256 && !event.error);
+    if (new Set(reviewFrames.map((frame) => frame.timeSeconds)).size < 2) throw new Error("Remotion 对照预览需要至少两张真实审查帧");
+    files.push({ path: entry.previewPath, kind: "remotion-preview", engine: "remotion", createdBy: "claude-code", width: entry.width, height: entry.height, durationMs: entry.durationMs, sha256: previewSha256 });
+    remotionComparisons.push({ status: "reviewed", engine: "remotion", remotionVersion: entry.remotionVersion, previewSha256, timelineSha256: entry.timelineSha256, frames: reviewFrames.map(({ timeSeconds, sha256 }) => ({ timeSeconds, sha256 })) });
+  }
   const brollAudit = (await fs.readFile(join(controlDir(dir), "broll-audit.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const downloaded = new Map(brollAudit.filter((entry) => entry.tool === "download_broll").map((entry) => [entry.assetId, entry]));
   const hyperframesSource = (manifest.sources || []).find((source) => /hyperframes|\.html$/i.test(source));
@@ -167,7 +194,7 @@ export async function validateAgentOutput(dir, phase) {
     if (shortProbe.width !== 1080 || shortProbe.height !== 1920) throw new Error("Shorts 必须为 1080×1920");
     files.push({ ...short, kind: "short", ...shortProbe });
   }
-  return { manifest, files, qc: { passed: true, main: probe, engine: "claude-code", model: EDITOR_MODEL, subtitlesBurnedIn: true, audioVideoSyncChecked: true, noUnexpectedBlackFrames: true, visualReview: { method: "claude-code-vision", frames: frames.map(({ timeSeconds, sha256 }) => ({ timeSeconds, sha256 })), notes: manifest.review.notes }, requiresHumanReview: true } };
+  return { manifest, files, qc: { passed: true, main: probe, engine: "claude-code", model: EDITOR_MODEL, subtitlesBurnedIn: true, audioVideoSyncChecked: true, noUnexpectedBlackFrames: true, visualReview: { method: "claude-code-vision", frames: frames.map(({ timeSeconds, sha256 }) => ({ timeSeconds, sha256 })), notes: manifest.review.notes }, remotionComparisons: remotionComparisons.length ? remotionComparisons : null, requiresHumanReview: true } };
 }
 
 export async function saveAgentOutput(project, phase, dir, runId, receipt) {

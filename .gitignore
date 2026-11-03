@@ -5,6 +5,7 @@ portal/.env.*
 portal/storage/
 portal/dist/
 portal/node_modules/
+portal/remotion-runtime/node_modules/
 
 # Other local/build output
 openchatcut-src/node_modules/

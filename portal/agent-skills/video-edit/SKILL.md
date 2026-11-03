@@ -26,6 +26,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - `mcp__video__download_broll`：只下载紧接着搜索得到并审查过的候选；一轮最多 3 个。任何 `brollEvents` 只能引用实际下载的素材。
 - `mcp__video__write_file` / `mcp__video__read_file`：管理脚本、字幕、HyperFrames 源码、计划和报告。
 - `mcp__video__view_frame`：真实视觉审片。不能用 FFmpeg 退出码、文件大小或文字描述代替。
+- `mcp__video__render_remotion_preview`：从当前 `input.mp4`、`brief.json` 和已校验的 `edit-plan.json` 生成 Remotion 动效对照预览；不接受路径或代码参数。预览只用于比较视觉样式，不替代 Wayne 正式草剪或终稿。
 
 ## 必须遵守的编辑流程
 
@@ -68,6 +69,10 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - 配乐必须低于人声并自动 duck。可使用 `ffmpeg` 合成短 SFX；最终目标参考为约 `-16 LUFS`、真峰值不高于 `-1.5 dBTP`，噪声被放大时要写入限制。
 
 优先使用可编辑的 HyperFrames HTML/GSAP 或 Python/FFmpeg 工程；不要使用无法复现的截图拼接或一次性命令。保留所有脚本、字幕、素材索引和命令日志。
+
+### Remotion 动效对照
+
+在 `plan` 和修改 `visualEvents` 的 `chat-edit` 阶段，先稳定 `edit-plan.json`，再调用一次 `mcp__video__render_remotion_preview`。用 `mcp__video__view_frame` 检查至少两个不同事件时点，判断标题是否更清楚、有没有挡住人物或关键信息。只有调整了 `visualEvents` 才进行第二次对照渲染；每轮最多两次。Remotion 输出会作为单独的对照视频保存到项目中，不能把原片叠字对照说成已完成剪辑，也不能替代 Wayne 的标准预览、HyperFrames 动效或终稿 QC。工具失败时记录原因并继续标准流程。
 
 ### 4. plan 阶段
 

@@ -73,7 +73,7 @@ TENCENTCLOUD_REGION=ap-guangzhou
 
 剪辑阶段会在项目中加载 `agent-skills/video-edit/SKILL.md`。Opus 检查旋转、音轨、真实原片帧和逐词转录，自主决定是否需要 B-roll；需要时通过受限 MCP 搜索 Pexels/Pixabay、查看候选缩略图、自动下载最多 3 条素材，并把实际来源、许可信息、SHA-256 和插入时间写入工程。随后它编写字幕、剪辑脚本、HyperFrames 工程（按需）与低清预览；批注后继续修改同一工程、导出终稿并重新查看成片抽帧。短样例可以没有额外 Shorts、标题卡或 CTA。媒体 shell 保持断网，任意 URL、外域重定向、超大或无效媒体都会被拒绝。
 
-Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回真实视频帧供视觉审查，FFmpeg/FFprobe/Python/Node 命令通过 Bubblewrap 在断网隔离环境运行，只能写入本轮工作区；工作区之外的项目、门户 `.env`、Claude 用户配置和宿主环境密钥不可读。每阶段模型费用限额为计划 `$4`、终稿 `$6`，会话上限 12 分钟。产物保留原视频之外的版本化预览、终稿、SRT/ASS、源码、工具日志和 QC 报告。人工仍须完整观看交付视频；AI 抽帧报告不是最终验收。
+Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回真实视频帧供视觉审查，FFmpeg/FFprobe/Python/Node 命令通过 Bubblewrap 在断网隔离环境运行，只能写入本轮工作区；工作区之外的项目、门户 `.env`、Claude 用户配置和宿主环境密钥不可读。每阶段模型费用限额为计划 `$4`、终稿 `$6`，Claude Code 会话硬上限为 30 分钟。产物保留原视频之外的版本化预览、终稿、SRT/ASS、源码、工具日志和 QC 报告。人工仍须完整观看交付视频；AI 抽帧报告不是最终验收。
 
 ## 当前真实能力
 
@@ -86,6 +86,10 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 - `POST /api/projects/:id/broll`：可上传 MP4/MOV/M4V/WebM B-roll（最多 100MB/个），需确认素材使用许可；Claude 只会在已上传素材中安排时间点，缺少素材时返回空列表；
 - `POST /api/projects/:id/broll/search`：保留手动候选搜索入口；正式 Claude Code 剪辑由 Opus 自己调用 MCP 搜索、查看和下载，搜索结果、实际下载、计划插入和最终审片分别记录；
 - `GET /api/projects/:id`：读取项目状态；
+- `GET /api/projects/:id/timeline`：将已确认计划转换为 path-safe `timeline.v1`，用于独立渲染器或 OpenChatCut sidecar；尚无计划时返回 409；
+- `GET /api/engines`：读取引擎集成状态；未完成真实渲染和 QC 的 adapter 明确标记为 disabled；
+- `POST /api/engines/openchatcut/probe`：连接本机 OpenChatCut MCP 并只读列出工具；需要配置本机 URL 和 Bearer token，不会选择项目或发起编辑；
+- `GET /api/engines/openchatcut/projects`：只在 loopback Wayne 页面读取 OpenChatCut 工程 ID、名称和更新时间；服务卡片中的目标选择只保存在当前页面，不会切换 OpenChatCut 工程或传输素材；
 - `GET /api/projects/:id/events`：SSE 状态流；
 - `POST /api/projects/:id/advance`：推进阶段，转录阶段调用火山引擎，失败后自动尝试腾讯云；
 - `POST /api/projects/:id/replan`：在现有工程和批注基础上重新启动 Claude Code / Opus 5.5，制作修订预览并视觉审查；
@@ -93,6 +97,7 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 - `POST /api/projects/:id/chat/messages`：把一条自然语言修改请求加入当前会话；请求立即返回，后台基于最新成功版本运行 Claude Code，并通过项目 SSE 推送 `chat_started`、`chat_completed` 或 `chat_failed`；
 - `POST /api/projects/:id/comments`：保存时间戳批注。
 - `POST /api/projects/:id/render`：继续同一个 Opus 5.5 剪辑工程，按批注生成终稿、短视频（适合时）和字幕，逐帧检查并修正。服务端独立检查真实审片帧、音视频流与同步、持续黑帧、白名单路径和导出分辨率；失败不会标记为 `completed`。
+- `POST /api/projects/:id/render/remotion-preview`：可选生成 Remotion ProRes 4444 alpha overlay 和 FFmpeg 合成对照预览；检查 alpha、画面尺寸、音视频同步和黑帧，不改变 Wayne 正式导出路径；
 - `GET /api/projects/:id/artifacts/:name`：下载项目白名单产物。
 
 ### 多轮对话调整
@@ -112,3 +117,13 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 ## 配乐与验证
 
 素材阶段可上传已获授权的配乐和 B-roll 并确认使用许可。在线搜索需要在服务端 `.env` 配置 `PEXELS_API_KEY` 和/或 `PIXABAY_API_KEY`；密钥不发送到浏览器。每次搜索最多 3 个分镜、每个分镜最多 2 个关键词；结果按关键词、方向、分辨率、时长预排序，不代表 VLM 视觉验证。搜索结果缓存 24 小时，每个来源 IP 每小时最多 20 次搜索；用户需在授权页确认具体素材许可，再自行下载并上传到项目，当前不会自动抓取/保存搜索结果。HyperFrames 使用单独锁定的 `hyperframes-runtime/`，不共享门户和 OpenChatCut 的 `node_modules`；Hook、重点、CTA 会渲染成透明 ProRes 4444 MOV，并与 HTML/GSAP 源码一起交付。FFmpeg 将其叠加到主片和 Shorts，再处理已上传 B-roll、字幕和配乐。运行 `npm run verify` 可验证计划约束、候选规范化与排序、透明动效、实际 FFmpeg 合成/QC，以及隔离存储中的素材许可校验和上传 API；`WAYNE_STORAGE_DIR` 可指定独立项目存储目录。手动查看 HyperFrames 样例：`cd hyperframes-demo && npm run check && npm run render`。
+
+### 可选视频引擎接入层
+
+当前默认引擎仍为 Wayne/Claude Code + FFmpeg + HyperFrames。共享契约位于 `contracts/timeline.v1.schema.json` 和 `contracts/render-manifest.v1.schema.json`，纯转换与校验代码在 `server/timeline-contract.mjs`。`GET /api/projects/:id/timeline` 只返回媒体元数据、剪辑事件和资源许可信息，不返回本机绝对路径；渲染器需要由受控 worker 根据 project ID 在授权工作区解析媒体文件。
+
+- `remotion-runtime/` 是独立 Remotion 4.0.539 renderer，自己锁定 `@remotion/*` 版本并把 Zod 覆盖到已修补版本，不复用 OpenChatCut 的 `node_modules`。Claude Code 可通过无路径参数的 `mcp__video__render_remotion_preview`，按当前 `edit-plan.json` 生成最多两次动效对照，并用 `view_frame` 审查；成功且与当前计划哈希一致的 MP4 会作为独立 `remotion-preview` 项目产物保存。它只把标题/重点叠加到原视频上，不替代 Wayne 草剪或正式导出。`npm run verify:remotion` 会真实渲染透明 ProRes overlay、验证 Claude MCP 调用、视觉审查和产物保存，并跑 API 合成 QC。当前本地免费使用假设为个人或不超过 3 人团队；官方规则见 [Remotion Free License FAQ](https://www.remotion.dev/docs/license/faq)。
+- `motion-templates/wayne-mg/` 是官方 Motion Canvas 3.17.2 脚手架，含 Hook 标题卡样例；Vite 5 只监听 `127.0.0.1`。模板可以导出图像序列，由 Wayne 现有 FFmpeg 组装，移植到 Remotion 并通过 QC 后才能被项目调用。
+- `openchatcut-adapter/` 通过本机 MCP 连接独立 OpenChatCut sidecar，不复制 AGPL-3.0-or-later 源码。只读探测和项目列表优先使用服务端环境变量 token，否则读取本机 `~/.openchatcut/mcp-token`；不把 token 返回浏览器。隔离开发 profile 使用各自的 token，联调时通过 Portal 服务端环境变量提供，不能把 token 放入 `VITE_*`。目标工程选择目前只读且不自动导入；实际编辑必须遵循 `begin_edit_session → edit tools → review_edit_session → readback`，并保留 OpenChatCut 的人工审批。
+
+项目验证新增 `node server/timeline-contract.verify.mjs` 和 `node server/engine-adapters.verify.mjs`；运行 `npm run verify:remotion` 可额外检查真实 Remotion alpha 渲染、FFmpeg 合成预览和 API 产物写入。

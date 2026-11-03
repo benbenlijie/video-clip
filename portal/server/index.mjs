@@ -1,10 +1,10 @@
 import { createServer } from "node:http";
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
-import { createReadStream, createWriteStream } from "node:fs";
+import { constants as fsConstants, createReadStream, createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { providerState, transcribeVideo } from "./transcription.mjs";
@@ -13,11 +13,15 @@ import { writeTranscriptArtifacts } from "./edit-plan.mjs";
 import { editWithClaudeCode, editorState } from "./claude-code-editor.mjs";
 import { brollProviderState, searchOnlineBroll } from "./broll-search.mjs";
 import { appendEditTurn, buildChatContext, completeEditTurn, createEditSession, failEditTurn } from "./edit-chat.mjs";
+import { createRenderManifest, getEngineAvailability, toTimelineV1 } from "./timeline-contract.mjs";
+import { compositeRemotionPreview, remotionRuntimeAvailable, renderRemotionOverlay } from "./remotion-overlay.mjs";
+import { detectBlackFrames, probeOutput } from "./render.mjs";
+import { listOpenChatCutProjects, probeOpenChatCut } from "./openchatcut-sidecar.mjs";
 
 try {
   if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
   const envText = await fs.readFile(new URL("../.env", import.meta.url), "utf8");
-  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE"]);
+  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE"]);
   for (const line of envText.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
     if (match && portalKeys.has(match[1])) process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
@@ -29,11 +33,42 @@ const store = createProjectStore(resolve(process.env.WAYNE_STORAGE_DIR || join(r
 const subscribers = new Map();
 const brollSearchRequests = new Map();
 const editorRuntime = editorState();
+const engineAvailability = getEngineAvailability({ remotion: await remotionRuntimeAvailable() });
+let openchatcutAvailability = { ...engineAvailability.openchatcut };
 await store.loadProjects();
+
+function availableEngines() {
+  return { ...engineAvailability, openchatcut: openchatcutAvailability };
+}
 
 function json(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(body));
+}
+
+function isLoopbackClient(req) {
+  const address = String(req.socket.remoteAddress || "").replace(/^::ffff:/i, "").split("%")[0];
+  if (address === "::1") return true;
+  const octets = address.split(".").map(Number);
+  return octets.length === 4 && octets[0] === 127 && octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255);
+}
+
+function isLoopbackPortalRequest(req) {
+  if (!isLoopbackClient(req) || req.headers["x-forwarded-for"]) return false;
+  const isLocalUrl = (value) => {
+    if (!value) return true;
+    try { return ["localhost", "127.0.0.1", "::1"].includes(new URL(value).hostname.replace(/^\[|\]$/g, "")); }
+    catch { return false; }
+  };
+  return isLocalUrl(`http://${req.headers.host || ""}`)
+    && isLocalUrl(req.headers.origin)
+    && isLocalUrl(req.headers.referer);
+}
+
+async function sha256File(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 function configState() {
@@ -48,6 +83,7 @@ function configState() {
     volcengine: transcription.volcengine,
     tencent: transcription.tencent,
     ffmpeg: true,
+    engines: availableEngines(),
     brollProviders: brollProviderState(),
     mode: allConfigured ? "configured" : anthropic || transcription.any ? "partial" : "demo",
   };
@@ -342,6 +378,30 @@ async function handle(req, res) {
   const segments = url.pathname.split("/").filter(Boolean);
   if (req.method === "GET" && url.pathname === "/api/health") return json(res, 200, { ok: true, service: "wayne-portal", config: configState() });
   if (req.method === "GET" && url.pathname === "/api/config") return json(res, 200, configState());
+  if (req.method === "GET" && url.pathname === "/api/engines") return json(res, 200, { engines: availableEngines() });
+  if (req.method === "POST" && url.pathname === "/api/engines/openchatcut/probe") {
+    if (!isLoopbackClient(req)) return json(res, 403, { error: "OpenChatCut sidecar probe 仅允许本机请求" });
+    try {
+      const result = await probeOpenChatCut();
+      openchatcutAvailability = { enabled: result.status === "ready", mode: result.status, license: "AGPL-3.0-or-later", toolCount: result.toolCount };
+      if (result.status !== "ready") return json(res, 409, result);
+      return json(res, 200, result);
+    } catch (error) {
+      openchatcutAvailability = { enabled: false, mode: "offline", license: "AGPL-3.0-or-later" };
+      const message = error.message === "The operation was aborted due to timeout" ? "OpenChatCut sidecar 连接超时" : error.message;
+      return json(res, error.message.includes("仅允许本机") ? 400 : 503, { status: "offline", error: message });
+    }
+  }
+  if (req.method === "GET" && url.pathname === "/api/engines/openchatcut/projects") {
+    if (!isLoopbackPortalRequest(req)) return json(res, 403, { error: "OpenChatCut 工程列表仅允许本机 Wayne 页面读取" });
+    try {
+      const projects = await listOpenChatCutProjects();
+      return json(res, 200, { projects });
+    } catch (error) {
+      const message = error.message === "The operation was aborted due to timeout" ? "OpenChatCut 工程列表读取超时" : error.message;
+      return json(res, 503, { error: message });
+    }
+  }
   if (req.method === "GET" && url.pathname === "/api/projects") {
     const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
     const projects = [...store.projects.values()].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""))).slice(0, limit).map(projectSummary);
@@ -357,6 +417,11 @@ async function handle(req, res) {
   const project = segments[0] === "api" && segments[1] === "projects" ? store.get(segments[2]) : null;
   if (!project) return json(res, 404, { error: "project not found" });
   if (req.method === "GET" && segments.length === 3) return json(res, 200, projectView(project));
+  if (req.method === "GET" && segments[3] === "timeline") {
+    if (!project.media || !project.plan) return json(res, 409, { error: "生成标准时间线需要已上传媒体和剪辑计划", status: project.status });
+    try { return json(res, 200, toTimelineV1(project)); }
+    catch (error) { return json(res, 422, { error: error.message, status: project.status }); }
+  }
   if (req.method === "POST" && segments[3] === "broll" && segments[4] === "search") {
     try {
       const providers = brollProviderState();
@@ -448,6 +513,81 @@ async function handle(req, res) {
       return json(res, 200, projectView(project));
     } catch (error) {
       return json(res, error.statusCode || 502, { error: error.message, status: project.status, project: projectView(project) });
+    }
+  }
+  if (req.method === "POST" && segments[3] === "render" && segments[4] === "remotion-preview") {
+    if (!engineAvailability.remotion.enabled) return json(res, 503, { error: "Remotion runtime 尚未安装", engine: engineAvailability.remotion });
+    if (!project.media?.path || !project.plan) return json(res, 409, { error: "Remotion 对照预览需要已上传媒体和剪辑计划", status: project.status });
+    if (["planning", "rendering", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在编辑或导出，请等待当前任务完成", status: project.status });
+    const timeline = toTimelineV1(project);
+    const version = Math.max(1, Number(project.editor?.version) || 1);
+    const runId = randomUUID();
+    const workDir = join(project.dir, "render-work", `remotion-${runId}`);
+    const overlayPath = join(workDir, "overlay.mov");
+    const previewPath = join(workDir, "preview.mp4");
+    try {
+      const overlay = await renderRemotionOverlay({ timeline, outputPath: overlayPath, workDir });
+      const preview = await compositeRemotionPreview({ inputPath: project.media.path, overlayPath, outputPath: previewPath });
+      const probe = await probeOutput(previewPath);
+      const blackFrames = await detectBlackFrames(previewPath);
+      const qcPassed = overlay.alpha && probe.width === project.media.width && probe.height === project.media.height && probe.avSyncDeltaMs !== null && probe.avSyncDeltaMs <= 250 && probe.avDurationDeltaMs !== null && probe.avDurationDeltaMs <= 250 && blackFrames.length === 0;
+      if (!qcPassed) throw new Error("Remotion 对照预览未通过尺寸、alpha、音视频同步或黑帧检查");
+
+      const artifactsDir = join(project.dir, "artifacts");
+      await fs.mkdir(artifactsDir, { recursive: true });
+      const prefix = `remotion-v${version}-${runId}`;
+      const names = { timeline: `${prefix}-timeline.json`, overlay: `${prefix}-overlay.mov`, preview: `${prefix}-preview.mp4`, manifest: `${prefix}-manifest.json`, log: `${prefix}-render-log.json` };
+      const timelineText = `${JSON.stringify(timeline, null, 2)}\n`;
+      const sourceMediaSha256 = await sha256File(project.media.path);
+      const timelineSha256 = createHash("sha256").update(timelineText).digest("hex");
+      const checks = ["prores-alpha", "dimensions", "audio-video-sync", "black-frames"];
+      const log = {
+        engine: "remotion",
+        engineVersion: overlay.remotionVersion,
+        renderer: "@remotion/renderer.renderMedia",
+        timelineContract: timeline.contract,
+        timelineSha256,
+        sourceMediaSha256,
+        outputSha256: { overlay: overlay.sha256, preview: preview.sha256 },
+        parameters: { width: overlay.width, height: overlay.height, durationMs: overlay.durationMs, fps: 30, eventCount: timeline.visualEvents.length },
+        qc: { passed: qcPassed, checks, audioVideoSyncDeltaMs: probe.avSyncDeltaMs, audioVideoDurationDeltaMs: probe.avDurationDeltaMs, blackFrameCount: blackFrames.length },
+        completedAt: new Date().toISOString(),
+      };
+      const logText = `${JSON.stringify(log, null, 2)}\n`;
+      await fs.writeFile(join(artifactsDir, names.timeline), timelineText, { flag: "wx" });
+      await fs.copyFile(overlayPath, join(artifactsDir, names.overlay), fsConstants.COPYFILE_EXCL);
+      await fs.copyFile(previewPath, join(artifactsDir, names.preview), fsConstants.COPYFILE_EXCL);
+      await fs.writeFile(join(artifactsDir, names.log), logText, { flag: "wx" });
+      const manifest = createRenderManifest({
+        timeline,
+        engine: "remotion",
+        engineVersion: overlay.remotionVersion,
+        status: "completed",
+        inputs: { timelineSha256, sourceMediaSha256 },
+        artifacts: [
+          { name: names.timeline, kind: "timeline", version, sha256: timelineSha256 },
+          { name: names.overlay, kind: "overlay", version, width: overlay.width, height: overlay.height, durationMs: overlay.durationMs, sha256: overlay.sha256 },
+          { name: names.preview, kind: "preview", version, width: preview.width, height: preview.height, durationMs: preview.durationMs, sha256: preview.sha256 },
+          { name: names.log, kind: "render-log", version, sha256: createHash("sha256").update(logText).digest("hex") },
+        ],
+        qc: { passed: qcPassed, checks },
+      });
+      await fs.writeFile(join(artifactsDir, names.manifest), JSON.stringify(manifest, null, 2), { flag: "wx" });
+      project.artifacts = [...(project.artifacts || []),
+        { name: names.timeline, kind: "timeline", engine: "remotion", version },
+        { name: names.overlay, kind: "overlay", engine: "remotion", version, width: overlay.width, height: overlay.height, durationMs: overlay.durationMs },
+        { name: names.preview, kind: "remotion-preview", engine: "remotion", version, width: preview.width, height: preview.height, durationMs: preview.durationMs },
+        { name: names.log, kind: "render-log", engine: "remotion", version, sha256: createHash("sha256").update(logText).digest("hex") },
+        { name: names.manifest, kind: "render-manifest", engine: "remotion", version },
+      ];
+      project.remotionPreview = { engine: "remotion", version, checkedAt: new Date().toISOString(), qc: manifest.qc };
+      project.error = null;
+      await save(project);
+      return json(res, 200, projectView(project));
+    } catch (error) {
+      return json(res, 502, { error: error.message, engine: "remotion", project: projectView(project) });
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
   if (req.method === "POST" && segments[3] === "input") {

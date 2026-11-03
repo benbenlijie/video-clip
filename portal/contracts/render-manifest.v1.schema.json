@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/render-manifest.v1.schema.json",
+  "title": "Wayne render-manifest.v1",
+  "type": "object",
+  "required": ["contract", "projectId", "timelineContract", "engine", "engineVersion", "status", "createdAt", "inputs", "artifacts", "qc", "error"],
+  "properties": {
+    "contract": { "const": "render-manifest.v1" },
+    "projectId": { "type": "string", "minLength": 1 },
+    "timelineContract": { "const": "timeline.v1" },
+    "engine": { "enum": ["wayne", "remotion", "openchatcut"] },
+    "engineVersion": { "type": ["string", "null"] },
+    "status": { "enum": ["planned", "running", "completed", "failed", "disabled"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "inputs": {
+      "type": "object",
+      "required": ["timelineSha256", "sourceMediaSha256"],
+      "properties": {
+        "timelineSha256": { "type": ["string", "null"] },
+        "sourceMediaSha256": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "kind", "version", "width", "height", "durationMs", "sha256"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "minLength": 1 },
+          "version": { "type": "integer", "minimum": 1 },
+          "width": { "type": ["integer", "null"], "minimum": 1 },
+          "height": { "type": ["integer", "null"], "minimum": 1 },
+          "durationMs": { "type": ["integer", "null"], "minimum": 1 },
+          "sha256": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "qc": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "object", "required": ["passed", "checks"], "properties": { "passed": { "type": "boolean" }, "checks": { "type": "array", "items": { "type": "string" } } }, "additionalProperties": false }
+      ]
+    },
+    "error": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

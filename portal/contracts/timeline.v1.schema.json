@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/timeline.v1.schema.json",
+  "title": "Wayne timeline.v1",
+  "type": "object",
+  "required": ["contract", "project", "media", "transcript", "assets", "segments", "visualEvents", "brollEvents", "shorts", "music"],
+  "properties": {
+    "contract": { "const": "timeline.v1" },
+    "project": {
+      "type": "object",
+      "required": ["id", "workflowId", "goal", "style", "sourceVersion"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "workflowId": { "type": "string" },
+        "goal": { "type": "string" },
+        "style": { "type": "string" },
+        "sourceVersion": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "media": {
+      "type": "object",
+      "required": ["assetId", "filename", "durationMs", "width", "height", "hasAudio", "hasVideo"],
+      "properties": {
+        "assetId": { "const": "source-video" },
+        "filename": { "type": "string" },
+        "durationMs": { "type": "integer", "minimum": 1 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "hasAudio": { "type": "boolean" },
+        "hasVideo": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "transcript": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["language", "segments"],
+          "properties": {
+            "language": { "type": ["string", "null"] },
+            "segments": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "startMs", "endMs", "text"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "startMs": { "type": "integer", "minimum": 0 },
+                  "endMs": { "type": "integer", "minimum": 1 },
+                  "text": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "assets": {
+      "type": "object",
+      "required": ["broll"],
+      "properties": {
+        "broll": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "filename", "durationMs", "width", "height", "licenseConfirmed", "licenseName", "licenseUrl", "sourceUrl", "sha256"],
+            "properties": {
+              "id": { "type": "string" },
+              "filename": { "type": "string" },
+              "durationMs": { "type": "integer", "minimum": 1 },
+              "width": { "type": "integer", "minimum": 1 },
+              "height": { "type": "integer", "minimum": 1 },
+              "licenseConfirmed": { "type": "boolean" },
+              "licenseName": { "type": ["string", "null"] },
+              "licenseUrl": { "type": ["string", "null"] },
+              "sourceUrl": { "type": ["string", "null"] },
+              "sha256": { "type": ["string", "null"] }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "segments": { "type": "array", "items": { "type": "object", "required": ["id", "startMs", "endMs", "action", "title", "note"] } },
+    "visualEvents": { "type": "array", "items": { "type": "object", "required": ["id", "type"] } },
+    "brollEvents": { "type": "array", "items": { "type": "object", "required": ["id", "assetId", "startMs", "endMs", "sourceStartMs"] } },
+    "shorts": { "type": "array", "items": { "type": "object", "required": ["id", "startMs", "endMs", "title"] } },
+    "music": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "object", "required": ["filename", "licenseConfirmed"], "properties": { "filename": { "type": "string" }, "licenseConfirmed": { "type": "boolean" } }, "additionalProperties": false }
+      ]
+    }
+  },
+  "additionalProperties": false
+}

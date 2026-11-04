@@ -11,6 +11,8 @@ import { compositeRemotionPreview, remotionRuntimeAvailable, renderRemotionOverl
 import { detectBlackFrames, probeOutput } from "./render.mjs";
 import { toTimelineV1 } from "./timeline-contract.mjs";
 import { registerBrollTools } from "./video-broll-tools.mjs";
+import { workspacePath } from "./workspace-path.mjs";
+import { composeRemotionMain } from "./remotion-main.mjs";
 
 const portalRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -20,28 +22,7 @@ async function sha256File(filePath) {
   return hash.digest("hex");
 }
 
-export async function workspacePath(root, relative, { existing = true } = {}) {
-  if (typeof relative !== "string" || !relative || relative.includes("\0")) throw new Error("Invalid workspace path");
-  const base = await fs.realpath(root);
-  const target = resolve(base, relative);
-  if (!target.startsWith(`${base}${sep}`)) throw new Error("Path must remain inside the edit workspace");
-  let parent = existing ? target : dirname(target);
-  while (true) {
-    try {
-      const real = await fs.realpath(parent);
-      if (real !== base && !real.startsWith(`${base}${sep}`)) throw new Error("Symlink escapes the edit workspace");
-      break;
-    } catch (error) {
-      if (error.code !== "ENOENT" || existing) throw error;
-      parent = dirname(parent);
-    }
-  }
-  // Existing leaf symlinks must also resolve inside the workspace before writes.
-  if (!existing) {
-    try { return await workspacePath(base, relative); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  }
-  return target;
-}
+export { workspacePath } from "./workspace-path.mjs";
 
 export async function sandboxCommand(workDir, command, timeoutMs = 180000) {
   // The host rejects any nested Bubblewrap namespace from Claude's sandbox.
@@ -99,6 +80,11 @@ export async function startMediaTools(workDir, auditPath) {
     if ((await fs.stat(target)).size > 350000) throw new Error("Text file exceeds 350KB; use execute to inspect a range");
     await audit({ tool: "read_file", path });
     return { content: [{ type: "text", text: await fs.readFile(target, "utf8") }] };
+  });
+  register("compose_remotion_video", "Compose the actual main preview/final from the already-cut baseVideo, timeline.json pieces (src/out in milliseconds), edit-plan.json, transcript.json and captions.srt. Reads the current phase and compositionMode from brief.json. Renders retained events on the EDITED timeline, burns the reviewed SRT, preserves audio, and returns a unique main MP4 plus retained alpha/source/hash evidence. Never use an uncut design comparison as the main video. Inspect the returned outputPath with view_frame and set manifest.main to that exact path, with compositionMode remotion-main.v1.", { baseVideo: z.string().min(1), phase: z.enum(["plan", "chat-edit", "render"]) }, async ({ baseVideo, phase }) => {
+    const result = await composeRemotionMain({ root, baseVideo, phase });
+    await audit({ tool: "compose_remotion_video", ...result });
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
   });
   register("render_remotion_preview", "Render a comparison preview from the current edit-plan.json and input.mp4 using the Wayne timeline.v1 contract. Takes no paths or arbitrary code. Call after the plan is ready, inspect the returned MP4 with view_frame, and use the result only as a visual-design comparison; the normal Wayne preview and final export remain authoritative. At most two comparison renders per edit run.", {}, async () => {
     if (remotionPreviewCount >= 2) throw new Error("每轮最多生成两次 Remotion 对照预览");

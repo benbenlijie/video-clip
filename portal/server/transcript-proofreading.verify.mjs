@@ -75,4 +75,27 @@ assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,400\n把繁�
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:00,650\n把繁琐\n", { ...accepted.transcript, segments: [{ ...accepted.transcript.segments[0], words: [{ startMs: 100, endMs: 300, text: "把" }, { startMs: 300, endMs: 650, text: "繁琐" }, { startMs: 650, endMs: 900, text: "的" }, { startMs: 900, endMs: 1000, text: "剪辑" }, { startMs: 1000, endMs: 1100, text: "工具" }, { startMs: 1100, endMs: 1200, text: "交给" }, { startMs: 1200, endMs: 1300, text: "AI" }] }, accepted.transcript.segments[1]] }, { segments: [{ startMs: 100, endMs: 650, action: "keep" }] }), true, "partial trims with word timestamps compare their retained words exactly");
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n把\n", accepted.transcript, { segments: [{ startMs: 100, endMs: 650, action: "keep" }] }), false, "a partial transcript segment without word timing cannot silently pass incomplete captions");
 
+const cutWithCaptionTail = { segments: [{ startMs: 0, endMs: 1000, action: "keep" }, { startMs: 2000, endMs: 3000, action: "keep" }] };
+const cutTailTranscript = { text: "你好世界", segments: [{ id: "hello", startMs: 0, endMs: 1000, text: "你好" }, { id: "world", startMs: 2000, endMs: 3000, text: "世界" }] };
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,200\n你好\n\n2\n00:00:01,000 --> 00:00:02,000\n世界\n", cutTailTranscript, cutWithCaptionTail), true, "readability extensions may clamp at the end of their retained clip");
+
+const visualCoverage = {
+  segments: [{ startMs: 0, endMs: 3000, action: "keep" }],
+  visualEvents: [{ id: "visual-world", startMs: 2000, endMs: 3000, type: "emphasis", text: "世界", subtext: "" }],
+  captionCoverage: [{ eventId: "visual-world", startMs: 2000, endMs: 3000, text: "世界" }],
+};
+const visuallyCaptionedTranscript = { text: "你好世界", segments: [
+  { id: "hello", startMs: 0, endMs: 1000, text: "你好", words: [{ startMs: 100, endMs: 500, text: "你" }, { startMs: 500, endMs: 1000, text: "好" }] },
+  { id: "world", startMs: 2000, endMs: 3000, text: "世界", words: [{ startMs: 2000, endMs: 2500, text: "世" }, { startMs: 2500, endMs: 3000, text: "界" }] },
+] };
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, visualCoverage, ["<div>世界</div>"]), true, "exact spoken words shown by a timed visual event can cover omitted SRT text");
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, visualCoverage, ["<div>字幕</div>"]), false, "visual coverage must exist in the declared overlay source");
+const actualPieces = [{ src: [0, 1000], out: [0, 1000] }, { src: [3000, 4000], out: [1000, 2000] }];
+const actualTranscript = { text: "你好世界", segments: [{ id: "one", startMs: 100, endMs: 900, text: "你好" }, { id: "two", startMs: 3100, endMs: 3900, text: "世界" }] };
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:00,900\n你好\n\n2\n00:00:03,100 --> 00:00:03,900\n世界\n", actualTranscript, { segments: actualPieces.map((piece) => ({ startMs: piece.src[0], endMs: piece.src[1], action: "keep" })) }, [], actualPieces), false, "a composed two-second video must reject uncut source SRT timestamps");
+const coverageMap = [{ src: [0, 3000], out: [0, 3000] }];
+const wrongEventCoverage = { ...visualCoverage, visualEvents: [{ id: "other", startMs: 0, endMs: 300, type: "emphasis", text: "世界" }, { id: "wrong", startMs: 2000, endMs: 3000, type: "emphasis", text: "概述" }], captionCoverage: [{ eventId: "wrong", startMs: 2000, endMs: 3000, text: "世界" }] };
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, wrongEventCoverage, ["世界 概述"], coverageMap, [{ sourceEventId: "other", startMs: 0, endMs: 300, text: "世界" }, { sourceEventId: "wrong", startMs: 2000, endMs: 3000, text: "概述" }]), false, "a word displayed by another event cannot cover missing subtitles");
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, visualCoverage, ["世界"], coverageMap, [{ sourceEventId: "visual-world", startMs: 2000, endMs: 3000, text: "世界" }]), true);
+
 console.log("transcript-proofreading.verify: evidence validation, manual fallback and subtitle text QC passed");

@@ -15,6 +15,9 @@ assert.match(prompt, /Remotion/);
 assert.match(prompt, /portrait 9:16/);
 assert.match(prompt, /transcript-proofread\.json/);
 assert.match(prompt, /cannot directly hear the audio/);
+assert.match(prompt, /captionCoverage/);
+assert.match(buildEditorPrompt("plan", "remotion-main.v1"), /compose_remotion_video/);
+assert.doesNotMatch(buildEditorPrompt("plan", "remotion-main.v1"), /use mcp__video__render_remotion_preview/);
 
 const root = await mkdtemp(join(tmpdir(), "wayne-editor-"));
 try {
@@ -33,6 +36,10 @@ try {
   assert.equal(JSON.parse(await readFile(join(dir, "brief.json"), "utf8")).projectId, project.id);
   assert.equal(JSON.parse(await readFile(join(dir, "transcript.original.json"), "utf8")).segments[0].text, "把烦做的");
   assert.equal(JSON.parse(await readFile(join(dir, "transcript.whisper.json"), "utf8")).segments[0].text, "把繁琐的");
+  assert.equal(JSON.parse(await readFile(join(dir, "brief.json"), "utf8")).compositionMode, undefined, "old projects stay in their original workflow");
+  project.compositionMode = "remotion-main.v1";
+  await prepareWorkspace(project, "chat-edit");
+  assert.equal(JSON.parse(await readFile(join(dir, "brief.json"), "utf8")).compositionMode, "remotion-main.v1");
   assert.match(await readFile(join(dir, ".claude/skills/video-edit/references/editorial-grammar.md"), "utf8"), /BROLL_COVER/);
   assert.match(await readFile(join(dir, ".claude/skills/video-edit/SKILL.md"), "utf8"), /HyperFrames 不是可选装饰/);
   console.log("claude-code-editor.verify: skill paths, prompt contract, and refresh behavior passed");

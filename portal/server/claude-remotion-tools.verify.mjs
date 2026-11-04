@@ -43,6 +43,8 @@ await Promise.all([
   fs.writeFile(path.join(root, "edit-plan.json"), JSON.stringify(plan)),
   fs.writeFile(path.join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:01,600\n把繁琐的剪辑工具交给AI\n"),
   fs.writeFile(path.join(root, "source.mjs"), "export const fixture = true;\n"),
+  fs.writeFile(path.join(root, "pipeline.filter"), "[0:v]null[v]\n"),
+  fs.writeFile(path.join(root, "commands.log"), "ffmpeg -i input.mp4\n"),
   fs.writeFile(path.join(control, "broll-audit.jsonl"), `${JSON.stringify({ tool: "download_broll", assetId: "downloaded-broll-1", filename: "broll-downloaded.mp4", path: "broll-downloaded.mp4", provider: "pixabay", providerId: "fixture", sourceUrl: "https://pixabay.com/videos/fixture/", licenseName: "Pixabay Content License", licenseUrl: "https://pixabay.com/service/license-summary/", sha256: downloadedBrollSha256, durationMs: 2000, width: 320, height: 180 })}\n`),
 ]);
 
@@ -74,7 +76,7 @@ try {
   }
 
   await fs.writeFile(path.join(root, "manifest.json"), JSON.stringify({
-    phase: "plan", main: result.previewPath, subtitle: "captions.srt", sources: ["edit-plan.json", "source.mjs"], shorts: [], broll: [],
+    phase: "plan", main: result.previewPath, subtitle: "captions.srt", sources: ["edit-plan.json", "source.mjs", "pipeline.filter", "commands.log"], shorts: [], broll: [],
     review: { passed: true, notes: "Inspected source and Remotion comparison frames." },
   }));
   await fs.writeFile(path.join(control, "session-plan.json"), JSON.stringify({ sessionId: "fixture", costUsd: 0 }));
@@ -90,6 +92,12 @@ try {
   assert.equal(createHash("sha256").update(await fs.readFile(path.join(root, "artifacts", storedPreview.name))).digest("hex"), result.sha256.preview);
   await fs.writeFile(path.join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:01,600\n把凡速的剪辑工具交给AI\n");
   await assert.rejects(validateAgentOutput(root, "plan"), /字幕文字与当前校对转录不一致/);
+  await fs.writeFile(path.join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:01,600\n把繁琐的剪辑工具交给AI\n");
+  const manifest = JSON.parse(await fs.readFile(path.join(root, "manifest.json"), "utf8"));
+  manifest.sources = [...manifest.sources, "unknown.bin"];
+  await fs.writeFile(path.join(root, "unknown.bin"), "fixture\n");
+  await fs.writeFile(path.join(root, "manifest.json"), JSON.stringify(manifest));
+  await assert.rejects(validateAgentOutput(root, "plan"), /不支持的工程源码类型/);
   console.log("claude-remotion-tools.verify: Claude MCP tool rendered, visually inspected, and persisted a Remotion comparison preview");
 } finally {
   await client.close().catch(() => undefined);

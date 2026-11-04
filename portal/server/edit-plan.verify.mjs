@@ -23,6 +23,18 @@ const plan = validateEditPlan({
 assert.equal(plan.visualEvents.length, 3);
 assert.equal(plan.visualEvents[0].type, "title_card");
 assert.equal(plan.visualEvents[2].subtext, "评论区聊聊");
+const captionStyled = validateEditPlan({ ...base, captionStyle: { fontSize: 28, marginV: 18, outline: 2, color: "#c6f475" } }, 10000);
+assert.deepEqual(captionStyled.captionStyle, { fontSize: 28, marginV: 18, outline: 2, color: "#c6f475" }, "subtitle presentation requests must survive plan validation");
+assert.throws(() => validateEditPlan({ ...base, captionStyle: { fontSize: 9999 } }, 10000), /字幕样式/);
+assert.throws(() => validateEditPlan({ ...base, captionStyle: { color: "white,FontSize=100" } }, 10000), /字幕样式/);
+
+const withCaptionCoverage = validateEditPlan({
+  ...base,
+  visualEvents: [{ id: "point", type: "emphasis", startMs: 3500, endMs: 5000, text: "Key point" }],
+  captionCoverage: [{ eventId: "point", startMs: 3800, endMs: 4200, text: "spoken words" }],
+}, 10000, { requireFiveShorts: false });
+assert.deepEqual(withCaptionCoverage.captionCoverage, [{ eventId: "point", startMs: 3800, endMs: 4200, text: "spoken words" }]);
+assert.throws(() => validateEditPlan({ ...base, visualEvents: validVisualEvents, captionCoverage: [{ eventId: "missing", startMs: 3800, endMs: 4200, text: "hidden words" }] }, 10000, { requireVisualEvents: true }), /字幕视觉覆盖区间无效/);
 
 const customBroll = validateEditPlan({ ...base, shorts: [], visualEvents: [{ id: "title", type: "emphasis-caption", startMs: 2000, endMs: 3000, text: "B-roll" }], brollEvents: [{ id: "broll-1", assetId: "asset-1", startMs: 2000, endMs: 3000, sourceStartMs: 0 }] }, 10000, { allowCustomVisualEvents: true, requireFiveShorts: false, brollAssets: [{ id: "asset-1", filename: "cutaway.mp4", durationMs: 2000, licenseConfirmed: true }] });
 assert.equal(customBroll.brollEvents.length, 1, "custom Claude Code plans must preserve downloaded B-roll events");

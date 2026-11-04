@@ -73,6 +73,11 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(health?.status, 200, `API failed to start: ${stderr}`);
+  const created = await fetch(`${base}/api/projects`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ goal: "isolated mode-persistence check" }) }).then((response) => response.json());
+  assert.equal(created.compositionMode, "remotion-main.v1");
+  assert.equal(JSON.parse(await fs.readFile(path.join(storage, created.id, "project.json"), "utf8")).compositionMode, "remotion-main.v1");
+  const oldProject = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
+  assert.equal(oldProject.compositionMode, undefined, "opening an existing project must not migrate its renderer");
 
   const enginesResponse = await fetch(`${base}/api/engines`);
   assert.equal(enginesResponse.status, 200);

@@ -15,9 +15,12 @@ assert.equal(nextEditVersion(project), 5, "a chat edit must increment from the l
 const session = createEditSession(project);
 assert.equal(session.latestVersion, 4);
 assert.equal(session.turnCount, 0);
+const withDiagnostics = { editor: { version: 5 }, editSession: { latestVersion: 5 }, artifacts: [{ kind: "preview", version: 2 }, { kind: "remotion-preview", version: 5 }] };
+assert.equal(createEditSession(withDiagnostics).latestVersion, 2, "only successfully registered main videos define the editing baseline");
 
 const first = appendEditTurn(session, { text: "00:18 到 00:24 节奏太慢，删掉停顿", timeMs: 18000 });
 assert.equal(first.turn.baseVersion, 4);
+assert.throws(() => appendEditTurn(session, { text: "修改旧版本", baseVersion: 2 }), /版本.*过期|最新版本/);
 assert.equal(first.turn.resultVersion, 5);
 assert.equal(first.session.latestVersion, 4, "a pending turn must not become the latest version before QC passes");
 assert.equal(first.session.turnCount, 1);

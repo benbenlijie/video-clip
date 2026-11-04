@@ -59,6 +59,13 @@ export function normalizeEditPlan(plan, durationMs) {
   };
 }
 
+export function normalizeCaptionStyle(style) {
+  if (style != null && (typeof style !== "object" || Array.isArray(style))) throw new Error("字幕样式格式无效");
+  const value = { fontSize: style?.fontSize ?? 20, marginV: style?.marginV ?? 24, outline: style?.outline ?? 1, color: style?.color ?? "#ffffff" };
+  if (!Number.isFinite(value.fontSize) || value.fontSize < 8 || value.fontSize > 64 || !Number.isFinite(value.marginV) || value.marginV < 0 || value.marginV > 160 || !Number.isFinite(value.outline) || value.outline < 0 || value.outline > 5 || typeof value.color !== "string" || !/^#[0-9a-f]{6}$/i.test(value.color)) throw new Error("字幕样式超出允许范围");
+  return { ...value, color: value.color.toLowerCase() };
+}
+
 export function validateEditPlan(plan, durationMs, { requireVisualEvents = false, requireFiveShorts = true, allowCustomVisualEvents = false, brollAssets = [] } = {}) {
   plan = normalizeEditPlan(plan, durationMs);
   if (!plan || !Array.isArray(plan.segments) || (requireFiveShorts && !Array.isArray(plan.shorts))) throw new Error("剪辑计划格式无效");
@@ -78,6 +85,21 @@ export function validateEditPlan(plan, durationMs, { requireVisualEvents = false
   });
   if (requireFiveShorts && shorts.length !== 5) throw new Error("剪辑计划必须包含 5 条 Shorts");
   const rawVisualEvents = Array.isArray(plan.visualEvents) ? plan.visualEvents : [];
+  const styledCaptions = plan.captionStyle == null ? {} : { captionStyle: normalizeCaptionStyle(plan.captionStyle) };
+  const validateCaptionCoverage = (visualEvents) => {
+    if (plan.captionCoverage == null) return [];
+    if (!Array.isArray(plan.captionCoverage) || plan.captionCoverage.length > 100) throw new Error("字幕视觉覆盖清单无效");
+    return plan.captionCoverage.map((item, index) => {
+      const event = visualEvents.find((candidate) => String(candidate.id) === String(item.eventId));
+      const startMs = Number(item.startMs);
+      const endMs = Number(item.endMs);
+      const text = String(item.text || "").trim();
+      if (!event || !Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < Number(event.startMs) || endMs > Number(event.endMs) || endMs <= startMs || !text || text.length > 300) {
+        throw new Error(`字幕视觉覆盖区间无效: ${index + 1}`);
+      }
+      return { eventId: String(item.eventId), startMs: Math.round(startMs), endMs: Math.round(endMs), text };
+    });
+  };
   if (allowCustomVisualEvents) {
     const visualEvents = rawVisualEvents.map((event, index) => {
       const startMs = event.startMs == null ? undefined : Number(event.startMs);
@@ -96,7 +118,7 @@ export function validateEditPlan(plan, durationMs, { requireVisualEvents = false
       if (!segments.some((segment) => segment.action !== "remove" && endMs > segment.startMs && startMs < segment.endMs)) throw new Error("B-roll 时间未落在保留片段");
       return { id: String(event.id || `broll-${index + 1}`), assetId, startMs: Math.round(startMs), endMs: Math.round(endMs), sourceStartMs: Math.round(sourceStartMs) };
     });
-    return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents };
+    return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents, ...styledCaptions, captionCoverage: validateCaptionCoverage(visualEvents) };
   }
   if (requireVisualEvents && rawVisualEvents.length < 3) throw new Error("剪辑计划必须包含可执行视觉事件");
   if (rawVisualEvents.length > 8) throw new Error("视觉事件不能超过 8 个");
@@ -128,7 +150,7 @@ export function validateEditPlan(plan, durationMs, { requireVisualEvents = false
     if (!segments.some((segment) => segment.action !== "remove" && endMs > segment.startMs && startMs < segment.endMs)) throw new Error("B-roll 时间未落在保留片段");
     return { id: event.id || `broll-${index + 1}`, assetId: asset.id, startMs: Math.round(startMs), endMs: Math.round(endMs), sourceStartMs: Math.round(sourceStartMs) };
   });
-  return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents };
+  return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents, ...styledCaptions, captionCoverage: validateCaptionCoverage(visualEvents) };
 }
 
 export function buildFallbackPlan(transcript, media, goal = "") {
@@ -190,4 +212,3 @@ export async function planWithClaude({ transcript, media, goal, style, comments 
   const text = (payload.content || []).filter((item) => item.type === "text").map((item) => item.text).join("\n");
   return extractJson(text);
 }
-

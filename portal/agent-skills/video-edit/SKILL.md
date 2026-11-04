@@ -1,6 +1,6 @@
 ---
 name: video-edit
-description: Edit real talking-head videos with Claude Code, word-timed transcripts, FFmpeg, HyperFrames and optional licensed B-roll. Use for every video editing phase. This project adapter combines public MIT/Apache-2.0 editing practices with the Cutline/Wayne plan, brand and QC contracts.
+description: Edit real talking-head videos with Claude Code, word-timed transcripts, FFmpeg, Remotion main compositions, legacy HyperFrames and optional licensed B-roll. Use for every video editing phase.
 ---
 
 # Claude Code 视频剪辑 / Cutline 项目适配版
@@ -18,6 +18,19 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 这些规则吸收了公开的 MIT/Apache-2.0 项目经验，但不复制它们的品牌、字体、模板或外部素材流程。当前工作区的输入输出、MCP 工具和服务器 QC 是最终契约。
 
+## 主视频制作方式
+
+先读 `brief.compositionMode`。值为 `remotion-main.v1` 的新工程必须使用以下主流程：
+
+1. Claude 决定剪辑、授权 B-roll、声音与视觉设计。用 FFmpeg 制作已实际裁剪的基础视频；基础视频不得提前烧入字幕或重复标题层。
+2. `edit-plan.json` 的标准动效使用 `title_card`、`emphasis`、`cta`。把实际逐帧裁剪结果写为 `timeline.json`：`{"pieces":[{"src":[0,1000],"out":[0,1000]},{"src":[3000,4000],"out":[1000,2000]}]}`，时间单位为毫秒，源区间与计划保留区间一致，输出连续。
+3. `captions.srt` 使用剪辑后的播放时间，所有文字来自当前确认的 `transcript.json`。字幕字号、垂直边距、描边与颜色通过 `edit-plan.json.captionStyle`（`fontSize` 8–64、`marginV` 0–160、`outline` 0–5、`color` 为 `#RRGGBB`）控制；用户要求字幕变大时须修改此样式，不能只改报告。完整保留语义，不用上下文猜词。读取 `.claude/skills/remotion/SKILL.md` 的动画和透明层规则。
+4. 调用 `mcp__video__compose_remotion_video({baseVideo:"实际基础视频.mp4",phase:"plan|chat-edit|render"})`。工具按剪辑映射渲染 Remotion、烧字幕、保留基础音轨，并返回唯一的 `outputPath`、透明层、源码快照和哈希记录。
+5. 对返回的主视频重新执行 `view_frame` 审查，至少三张跨时段帧，并覆盖每个实际动效和 B-roll；`manifest.main` 必须是这个准确的 `outputPath`，声明 `compositionMode: "remotion-main.v1"`。
+6. 终稿使用源片目标尺寸重做基础视频和动效，沿用已审核的 `edit-plan.json`、`timeline.json`、`captions.srt` 与动效设计。不要修改终稿计划来绕过一致性检查。修改意见的时码属于 `brief.chatTurn.baseVersion` 的预览，不属于原片时间；根据已有映射定位素材。
+
+此模式下不生成独立 Remotion 对照，也不强制生成 HyperFrames；同一个动效不要做两遍。合成失败即本轮未完成，保留旧版并说明原因，不能悄悄去掉动效。下面关于 HyperFrames 和动效对照的要求仅适用于没有此模式标记的旧工程；其余转录、授权、审片与 QC 规则共同适用。
+
 ## 工具与隔离环境
 
 - `mcp__video__execute`：离线 Linux shell。可写目录只有 `/work`；FFmpeg、FFprobe、Python、Node 和已安装的 HyperFrames 可用。禁止安装包、访问任意外网或读取工作区外文件。
@@ -26,6 +39,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - `mcp__video__download_broll`：只下载紧接着搜索得到并审查过的候选；一轮最多 3 个。任何 `brollEvents` 只能引用实际下载的素材。
 - `mcp__video__write_file` / `mcp__video__read_file`：管理脚本、字幕、HyperFrames 源码、计划和报告。
 - `mcp__video__view_frame`：真实视觉审片。不能用 FFmpeg 退出码、文件大小或文字描述代替。
+- `mcp__video__compose_remotion_video`：新模式下真正合成主视频；输出不可替换为独立对照，真实合成记录必须能与主视频绑定。
 - `mcp__video__render_remotion_preview`：从当前 `input.mp4`、`brief.json` 和已校验的 `edit-plan.json` 生成 Remotion 动效对照预览；不接受路径或代码参数。预览只用于比较视觉样式，不替代 Wayne 正式草剪或终稿。
 
 ## 必须遵守的编辑流程
@@ -65,8 +79,9 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - 统一使用项目令牌：`#f1f3ea`（ink）、`#c6f475`（mint）、`#f58c53`（orange）、`#111311`（panel）。新颜色、字体和动效先写入项目说明。
 - 竖屏 9:16 画面必须优先为手机观看设计：关键文字放在中间 70% 安全区；标题卡不超过画面高度约 22%，持续 0.8–2.5 秒；每个字幕组 1–4 个词或一行短语；不要让大段文字长期覆盖头顶或胸口。
 - 9:16 口播至少安排两类画面变化：`PUNCH_IN` 加 `BROLL_COVER`/`SPLIT`/`HyperFrames` 动效中的至少一类。每 8–15 秒应有一次可解释的视觉变化，但不要把所有变化都做成同一种卡片。
-- HyperFrames 不是可选装饰：在可用时至少制作一个 Hook、重点或转场动效，并在 `manifest.sources` 和 `manifest.review.notes` 中列出实际执行的动效源与审片时间。
+- 旧工程中 HyperFrames 不是可选装饰：在可用时至少制作一个 Hook、重点或转场动效，并在 `manifest.sources` 和 `manifest.review.notes` 中列出实际执行的动效源与审片时间。新主模式用 Remotion 实现并验收同样的真实动效。
 - 人脸特写字幕放在胸口或安全带，通常 1–2 行；不能遮挡眼睛、嘴或屏幕关键内容。不要同时显示内容完全重复的标题和字幕。
+- 字幕必须覆盖所有保留的口播。如果某些口播词由对应时间的 HyperFrames 动效逐字呈现、因此从 `captions.srt` 隐藏，必须在 `edit-plan.json.captionCoverage` 中写出 `eventId`、精确源时间和逐字文本；不能用概述或语义相近的文案代替。该词句必须能在 `manifest.sources` 声明的 HTML/JS 动效源码中找到，并在成片审片帧中确认。
 - A-roll 是声音骨架；B-roll 覆盖画面但不能改变口播事实。B-roll 必须有来源、许可和最终审片帧。
 - 配乐必须低于人声并自动 duck。可使用 `ffmpeg` 合成短 SFX；最终目标参考为约 `-16 LUFS`、真峰值不高于 `-1.5 dBTP`，噪声被放大时要写入限制。
 
@@ -74,7 +89,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 ### Remotion 动效对照
 
-在 `plan` 和修改 `visualEvents` 的 `chat-edit` 阶段，先稳定 `edit-plan.json`，再调用一次 `mcp__video__render_remotion_preview`。用 `mcp__video__view_frame` 检查至少两个不同事件时点，判断标题是否更清楚、有没有挡住人物或关键信息。只有调整了 `visualEvents` 才进行第二次对照渲染；每轮最多两次。Remotion 输出会作为单独的对照视频保存到项目中，不能把原片叠字对照说成已完成剪辑，也不能替代 Wayne 的标准预览、HyperFrames 动效或终稿 QC。工具失败时记录原因并继续标准流程。
+仅在旧工程的 `plan` 和修改 `visualEvents` 的 `chat-edit` 阶段，先稳定 `edit-plan.json`，再调用一次 `mcp__video__render_remotion_preview`。用 `mcp__video__view_frame` 检查至少两个不同事件时点，判断标题是否更清楚、有没有挡住人物或关键信息。只有调整了 `visualEvents` 才进行第二次对照渲染；每轮最多两次。Remotion 输出会作为单独的对照视频保存到项目中，不能把原片叠字对照说成已完成剪辑，也不能替代 Wayne 的标准预览、HyperFrames 动效或终稿 QC。工具失败时记录原因并继续标准流程。
 
 ### 4. plan 阶段
 

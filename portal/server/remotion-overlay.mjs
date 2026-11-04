@@ -52,7 +52,7 @@ function rendererInput(timeline) {
   return {
     width: Math.max(16, Math.round(Number(media.width) || 0)),
     height: Math.max(16, Math.round(Number(media.height) || 0)),
-    fps: 30,
+    fps: Number(media.fps) || 30,
     durationMs: Math.max(1, Math.round(Number(media.durationMs) || 0)),
     events: timeline.visualEvents.map((event) => ({
       id: String(event.id),
@@ -72,9 +72,13 @@ async function probeAlpha(outputPath, expected) {
   if (!stream || !String(stream.pix_fmt).startsWith("yuva") || Number(stream.width) !== expected.width || Number(stream.height) !== expected.height) {
     throw new Error("Remotion 输出未通过 ProRes 4444 alpha/尺寸检查");
   }
-  const { stderr } = await run("ffmpeg", ["-hide_banner", "-i", outputPath, "-vf", "alphaextract,signalstats,metadata=print", "-frames:v", "4", "-f", "null", "-"], portalRoot, 30000);
+  const visibleEvent = expected.events.find((event) => event.endMs > event.startMs && event.startMs < expected.durationMs);
+  if (!visibleEvent) throw new Error("Remotion 没有可见的保留动效");
+  const sampleSeconds = (visibleEvent.startMs + Math.min(visibleEvent.endMs, expected.durationMs)) / 2000;
+  const { stderr } = await run("ffmpeg", ["-hide_banner", "-ss", String(sampleSeconds), "-i", outputPath, "-vf", "alphaextract,signalstats,metadata=print", "-frames:v", "1", "-f", "null", "-"], portalRoot, 30000);
   const maxima = [...stderr.matchAll(/lavfi\.signalstats\.YMAX=(\d+)/g)].map((match) => Number(match[1]));
-  if (!maxima.some((value) => value === 0) || !maxima.some((value) => value > 0)) throw new Error("Remotion alpha 检查未发现透明背景和可见像素");
+  const minima = [...stderr.matchAll(/lavfi\.signalstats\.YMIN=(\d+)/g)].map((match) => Number(match[1]));
+  if (!minima.some((value) => value === 0) || !maxima.some((value) => value > 0)) throw new Error("Remotion alpha 检查未发现透明背景和可见像素");
   return { width: Number(stream.width), height: Number(stream.height), durationMs: Math.round(Number(probe.format?.duration || 0) * 1000), codec: stream.codec_name, pixelFormat: stream.pix_fmt, alpha: true, sha256: await sha256File(outputPath) };
 }
 
@@ -106,16 +110,19 @@ export async function renderRemotionOverlay({ timeline, outputPath, workDir = di
   }
 }
 
-export async function compositeRemotionPreview({ inputPath, overlayPath, outputPath }) {
+export async function compositeRemotionPreview({ inputPath, overlayPath, outputPath, subtitlePath = null, captionStyle = { fontSize: 20, outline: 1, marginV: 24, color: "#ffffff" }, durationMs = null, phase = "plan" }) {
   const target = resolve(outputPath);
   await fs.mkdir(dirname(target), { recursive: true });
   await fs.access(target).then(() => { throw new Error("Refusing to overwrite an existing preview output"); }, () => undefined);
   try {
+    const escapedSubtitle = subtitlePath ? resolve(subtitlePath).replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("'", "\\'") : null;
+    const color = captionStyle.color.slice(5, 7) + captionStyle.color.slice(3, 5) + captionStyle.color.slice(1, 3);
+    const filter = `[0:v][1:v]overlay=0:0:format=auto:eof_action=pass${escapedSubtitle ? `,subtitles='${escapedSubtitle}':force_style='FontName=Noto Sans CJK SC,FontSize=${captionStyle.fontSize},Outline=${captionStyle.outline},Alignment=2,MarginV=${captionStyle.marginV},PrimaryColour=&H00${color}'` : ""}[v]`;
     await run("ffmpeg", [
       "-y", "-hide_banner", "-i", resolve(inputPath), "-i", resolve(overlayPath),
-      "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto:eof_action=pass[v]",
-      "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-      "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", target,
+      "-filter_complex", filter,
+      "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", phase === "render" ? "20" : "24",
+      "-c:a", "copy", ...(durationMs ? ["-t", String(durationMs / 1000)] : []), "-shortest", "-movflags", "+faststart", target,
     ], portalRoot);
     const { stdout } = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height", "-of", "json", target], portalRoot, 30000);
     const probe = JSON.parse(stdout);

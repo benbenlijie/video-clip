@@ -6,13 +6,17 @@ function numericVersion(value) {
   return Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : 0;
 }
 
+export function mainArtifactVersion(project) {
+  return (project.artifacts || []).filter((artifact) => ["video", "preview"].includes(artifact.kind)).reduce((highest, artifact) => Math.max(highest, numericVersion(artifact.version) || 1), 0);
+}
+
 export function nextEditVersion(project = {}) {
-  const artifactVersion = (project.artifacts || []).reduce((highest, artifact) => Math.max(highest, numericVersion(artifact.version)), 0);
-  return Math.max(numericVersion(project.editSession?.latestVersion), numericVersion(project.editor?.version), artifactVersion) + 1;
+  const artifactVersion = mainArtifactVersion(project);
+  return (artifactVersion || Math.max(numericVersion(project.editSession?.latestVersion), numericVersion(project.editor?.version))) + 1;
 }
 
 export function createEditSession(project = {}) {
-  const latestVersion = Math.max(numericVersion(project.editSession?.latestVersion), numericVersion(project.editor?.version), (project.artifacts || []).reduce((highest, artifact) => Math.max(highest, numericVersion(artifact.version)), 0), 1);
+  const latestVersion = mainArtifactVersion(project) || Math.max(numericVersion(project.editSession?.latestVersion), numericVersion(project.editor?.version), 1);
   return {
     sessionId: project.editSession?.sessionId || null,
     latestVersion,
@@ -30,6 +34,7 @@ export function appendEditTurn(session, { text, timeMs = null, rangeEndMs = null
   const current = createEditSession({ editSession: session });
   if (current.status === "running") throw new Error("当前已有对话修改正在执行，请等待本轮完成");
   const resolvedBaseVersion = numericVersion(baseVersion) || current.latestVersion;
+  if (resolvedBaseVersion !== current.latestVersion) throw Object.assign(new Error("修改所基于的版本已过期，请回到最新版本后重试"), { statusCode: 409 });
   const turn = {
     id: `turn-${String(current.turnCount + 1).padStart(4, "0")}-${randomUUID().slice(0, 8)}`,
     baseVersion: resolvedBaseVersion,

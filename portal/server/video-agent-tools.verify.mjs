@@ -13,7 +13,7 @@ const client = new Client({ name: "video-agent-tools-verify", version: "1.0.0" }
 try {
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((item) => item.name).sort(), ["download_broll", "execute", "read_file", "render_remotion_preview", "search_broll", "view_broll_candidate", "view_frame", "write_file"]);
+  assert.deepEqual(tools.tools.map((item) => item.name).sort(), ["compose_remotion_video", "download_broll", "execute", "read_file", "render_remotion_preview", "search_broll", "view_broll_candidate", "view_frame", "write_file"]);
   assert.deepEqual(tools.tools.find((item) => item.name === "render_remotion_preview")?.inputSchema.properties, {}, "Remotion must use the current workspace plan and fixed paths");
   await assert.rejects(workspacePath(root, "../escape"), /inside the edit workspace/);
   await client.callTool({ name: "write_file", arguments: { path: "sample.srt", content: "1\n00:00:00,000 --> 00:00:01,000\nTest\n" } });

@@ -17,7 +17,7 @@ const timeline = {
   transcript: null,
   assets: { broll: [] },
   segments: [{ id: "segment-1", startMs: 0, endMs: 1200, action: "keep", title: "Main", note: "" }],
-  visualEvents: [{ id: "hook", type: "title_card", startMs: 0, endMs: 800, text: "Remotion output", subtext: "alpha test" }],
+  visualEvents: [{ id: "hook", type: "title_card", startMs: 600, endMs: 1100, text: "Remotion output", subtext: "alpha test" }],
   brollEvents: [],
   shorts: [],
   music: null,

@@ -9,6 +9,7 @@ import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { providerState, transcribeVideo } from "./transcription.mjs";
 import { getWhisperConfig } from "./local-whisper.mjs";
+import { REMOTION_MAIN_MODE } from "./remotion-main.mjs";
 import { createProjectStore } from "./project-store.mjs";
 import { writeTranscriptArtifacts } from "./edit-plan.mjs";
 import { applyTranscriptReview, ensureTranscriptReviewState } from "./transcript-review.mjs";
@@ -308,7 +309,7 @@ async function serveFile(req, res, path, contentType, disposition = "inline") {
 
 async function createProject(body = {}) {
   const id = randomUUID();
-  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, transcription: null, proofreading: null, plan: null, qc: null, error: null, upload: null, editSession: null };
+  const project = { id, workflowId: "wayne-video-editing", compositionMode: REMOTION_MAIN_MODE, status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, transcription: null, proofreading: null, plan: null, qc: null, error: null, upload: null, editSession: null };
   await save(project);
   return project;
 }
@@ -713,7 +714,7 @@ async function handle(req, res) {
     try {
       const body = await readJson(req);
       const session = ensureEditSession(project);
-      const appended = appendEditTurn(session, { text: body.text, timeMs: body.timeMs, rangeEndMs: body.rangeEndMs, baseVersion: session.latestVersion });
+      const appended = appendEditTurn(session, { text: body.text, timeMs: body.timeMs, rangeEndMs: body.rangeEndMs, baseVersion: body.baseVersion ?? session.latestVersion });
       project.editSession = appended.session;
       project.status = "chat_editing";
       project.error = null;
@@ -725,7 +726,7 @@ async function handle(req, res) {
   }
   if (req.method === "POST" && segments[3] === "render") {
     if (!project.plan) return json(res, 409, { error: "请先生成并确认剪辑计划", status: project.status });
-    if (["planning", "rendering"].includes(project.status)) return json(res, 409, { error: "Claude Code 正在处理中，请等待本轮完成" });
+    if (["planning", "rendering", "chat_editing"].includes(project.status) || project.editSession?.status === "running") return json(res, 409, { error: "当前已有制作任务，请等待本轮完成后再导出" });
     if (["needs_review", "manual_review_required"].includes(project.proofreading?.status)) return json(res, 409, { error: "字幕仍有待确认内容，请先完成字幕校对", status: project.status });
     if (project.proofreading?.previewStale || (project.proofreading?.previewTranscriptSha256 && project.proofreading.previewTranscriptSha256 !== transcriptFingerprint(project.transcript))) return json(res, 409, { error: "字幕已修改，预览字幕尚未更新；请先在对话中让 Claude 重新生成预览", status: project.status });
     if (project.editor?.engine !== "claude-code" || !project.editor.runId) return json(res, 409, { error: "这是旧版模板计划，请先重新生成 Claude Code 工程和预览", status: project.status });

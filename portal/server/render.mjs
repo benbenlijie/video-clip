@@ -16,7 +16,7 @@ function run(command, args, cwd) {
 }
 
 export async function probeOutput(path) {
-  const { stdout } = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height,duration,start_time", "-of", "json", path]);
+  const { stdout } = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height,duration,start_time,avg_frame_rate", "-of", "json", path]);
   const payload = JSON.parse(stdout);
   const durationMs = Math.round(Number(payload.format?.duration || 0) * 1000);
   const video = payload.streams?.find((stream) => stream.codec_type === "video");
@@ -27,7 +27,8 @@ export async function probeOutput(path) {
   const avSyncDeltaMs = Number.isFinite(Number(video.start_time)) && Number.isFinite(Number(audio.start_time))
     ? Math.round(Math.abs(Number(video.start_time) - Number(audio.start_time)) * 1000) : null;
   const avDurationDeltaMs = videoDuration > 0 && audioDuration > 0 ? Math.round(Math.abs(videoDuration - audioDuration) * 1000) : null;
-  return { durationMs, width: Number(video.width || 0), height: Number(video.height || 0), hasVideo: true, hasAudio: true, avSyncDeltaMs, avDurationDeltaMs };
+  const [fpsNumerator, fpsDenominator] = String(video.avg_frame_rate || "0/1").split("/").map(Number);
+  return { durationMs, videoDurationMs: Math.round(videoDuration * 1000), fps: fpsDenominator ? fpsNumerator / fpsDenominator : 0, width: Number(video.width || 0), height: Number(video.height || 0), hasVideo: true, hasAudio: true, avSyncDeltaMs, avDurationDeltaMs };
 }
 
 export async function detectBlackFrames(path) {

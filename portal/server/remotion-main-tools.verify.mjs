@@ -1,0 +1,134 @@
+import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { createServer } from "node:net";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { probeOutput } from "./render.mjs";
+import { prepareWorkspace, saveAgentOutput, validateAgentOutput } from "./claude-code-editor.mjs";
+
+const storageRoot = await fs.mkdtemp(join(tmpdir(), "wayne-main-remotion-"));
+const projectDir = join(storageRoot, "main-fixture");
+const runId = "11111111-1111-4111-8111-111111111111";
+const root = join(projectDir, "agent-runs", runId);
+await fs.mkdir(root, { recursive: true });
+const control = join(root, "..", `.control-${runId}`);
+await fs.mkdir(control);
+const auditPath = join(control, "tools-plan.jsonl");
+const transport = new StdioClientTransport({ command: process.execPath, args: [resolve("server/video-agent-tools.mjs"), root, auditPath] });
+const client = new Client({ name: "main-composition-verify", version: "1.0.0" });
+let apiProcess;
+async function ffmpeg(args) {
+  const child = spawn("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", ...args], { cwd: root });
+  let error = ""; child.stderr.on("data", (data) => { error += data; });
+  assert.equal(await new Promise((done, reject) => { child.on("error", reject); child.on("close", done); }), 0, error);
+}
+const transcript = { provider: "fixture", text: "你好世界", language: "zh", durationMs: 4000, segments: [{ id: "one", startMs: 100, endMs: 900, text: "你好" }, { id: "two", startMs: 3100, endMs: 3900, text: "世界" }] };
+const plan = { summary: "实际删除中间两秒", captionStyle: { fontSize: 26, marginV: 18, outline: 2, color: "#c6f475" }, segments: [{ id: "one", startMs: 0, endMs: 1000, action: "keep" }, { id: "cut", startMs: 1000, endMs: 3000, action: "remove" }, { id: "two", startMs: 3000, endMs: 4000, action: "keep" }], visualEvents: [{ id: "late", type: "emphasis", startMs: 3200, endMs: 3800, text: "世界" }], brollEvents: [], shorts: [] };
+try {
+  await client.connect(transport);
+  assert.ok((await client.listTools()).tools.some((tool) => tool.name === "compose_remotion_video"), "Claude must have a tool that composes Remotion into the actual main video");
+  await ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=4", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", "input.mp4"]);
+  await ffmpeg(["-i", "input.mp4", "-filter_complex", "[0:v]split[v0][v1];[0:a]asplit[a0][a1];[v0]trim=0:1,setpts=PTS-STARTPTS[v00];[v1]trim=3:4,setpts=PTS-STARTPTS[v11];[a0]atrim=0:1,asetpts=PTS-STARTPTS[a00];[a1]atrim=3:4,asetpts=PTS-STARTPTS[a11];[v00][a00][v11][a11]concat=n=2:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-c:a", "aac", "base.mp4"]);
+  await ffmpeg(["-i", "base.mp4", "-vf", "scale=320:180", "-c:a", "copy", "base-preview.mp4"]);
+  const brief = { phase: "plan", projectId: "main-fixture", compositionMode: "remotion-main.v1", media: { durationMs: 4000, width: 640, height: 360, hasAudio: true, hasVideo: true } };
+  await Promise.all(Object.entries({ "brief.json": brief, "edit-plan.json": plan, "transcript.json": transcript, "transcript.original.json": transcript, "transcript-proofread.json": { status: "manual_review_required", transcript, changes: [], unresolved: [] }, "timeline.json": { pieces: [{ src: [0, 1000], out: [0, 1000] }, { src: [3000, 4000], out: [1000, 2000] }] } }).map(([name, value]) => fs.writeFile(join(root, name), JSON.stringify(value))));
+  await fs.writeFile(join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:00,900\n你好\n\n2\n00:00:01,100 --> 00:00:01,900\n世界\n");
+  const correctCaptions = await fs.readFile(join(root, "captions.srt"));
+  await fs.writeFile(join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:00,900\n你好\n\n2\n00:00:03,100 --> 00:00:03,900\n世界\n");
+  assert.equal((await client.callTool({ name: "compose_remotion_video", arguments: { baseVideo: "base-preview.mp4", phase: "plan" } })).isError, true, "the tool must reject uncut source captions before declaring its composition successful");
+  await fs.writeFile(join(root, "captions.srt"), correctCaptions);
+  const response = await client.callTool({ name: "compose_remotion_video", arguments: { baseVideo: "base-preview.mp4", phase: "plan" } });
+  assert.ok(!response.isError, JSON.stringify(response));
+  const result = JSON.parse(response.content.find((item) => item.type === "text").text);
+  assert.equal(result.compositionMode, "remotion-main.v1");
+  assert.equal(result.events[0].startMs, 1200);
+  assert.equal(result.events[0].endMs, 1800);
+  assert.equal(result.captionStyle.fontSize, 26, "the main compositor must apply the approved caption style");
+  const probe = await probeOutput(join(root, result.outputPath));
+  assert.equal(probe.width, 320); assert.equal(probe.height, 180); assert.ok(Math.abs(probe.durationMs - 2000) < 250); assert.equal(probe.hasAudio, true);
+  assert.equal(createHash("sha256").update(await fs.readFile(join(root, result.outputPath))).digest("hex"), result.sha256.output);
+  await fs.access(join(root, result.overlayPath));
+  await fs.access(join(root, result.inputPath));
+  const { validateRemotionComposition } = await import("./remotion-main.mjs");
+  const audit = (await fs.readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const manifest = { compositionMode: "remotion-main.v1", phase: "plan", main: result.outputPath, subtitle: "captions.srt", sources: ["edit-plan.json", "timeline.json"], shorts: [], broll: [], review: { passed: true, notes: "实际主视频动效与字幕检查" } };
+  assert.ok((await validateRemotionComposition({ dir: root, phase: "plan", manifest, audit })).files.length >= 3);
+  await assert.rejects(validateRemotionComposition({ dir: root, phase: "plan", manifest: { ...manifest, subtitle: "different.srt" }, audit }), /字幕.*不一致|字幕.*绑定/);
+  for (const video of ["input.mp4", result.outputPath]) for (const timeSeconds of video === "input.mp4" ? [0.2, 2, 3.6] : [0.2, 0.8, 1.5]) {
+    const frame = await client.callTool({ name: "view_frame", arguments: { video, timeSeconds } });
+    assert.ok(!frame.isError && frame.content.some((item) => item.type === "image"));
+  }
+  await fs.writeFile(join(root, "manifest.json"), JSON.stringify(manifest));
+  await fs.writeFile(join(control, "session-plan.json"), JSON.stringify({ sessionId: "fixture", costUsd: 0 }));
+  const project = { id: "main-fixture", compositionMode: "remotion-main.v1", dir: projectDir, media: brief.media, transcript, artifacts: [{ kind: "preview", name: "old-main.mp4", version: 1 }, { kind: "remotion-preview", name: "old-diagnostic.mp4", version: 5 }], editor: { version: 1, runId }, brollAssets: [] };
+  const saved = await saveAgentOutput(project, "plan", root, "11111111-1111-4111-8111-111111111111", { sessionId: "fixture", costUsd: 0 });
+  assert.equal(saved.qc.remotionComposition?.compositionMode, "remotion-main.v1", "saving the main video must include verified Remotion composition evidence");
+  assert.equal(saved.editor.version, 2, "saving must use the next main-video version, not a diagnostic version");
+  assert.ok(saved.artifacts.some((item) => item.kind === "render-layer"));
+  await fs.writeFile(join(root, "manifest.json"), JSON.stringify({ ...manifest, main: "base.mp4" }));
+  await assert.rejects(validateAgentOutput(root, "plan", { compositionMode: "remotion-main.v1" }), /合成记录|审片帧/);
+  await fs.writeFile(join(root, "manifest.json"), JSON.stringify(manifest));
+  for (const [name, pattern] of [["edit-plan.json", /过期|哈希|不一致/], ["captions.srt", /过期|哈希|不一致/], ["timeline.json", /过期|哈希|不一致/], [result.overlayPath, /过期|哈希|不一致/], [result.outputPath, /过期|哈希|不一致/]]) {
+    await validateRemotionComposition({ dir: root, phase: "plan", manifest, audit });
+    const path = join(root, name); const before = await fs.readFile(path);
+    await fs.appendFile(path, " ");
+    await assert.rejects(validateRemotionComposition({ dir: root, phase: "plan", manifest, audit }), pattern, `${name} replacement must invalidate composition`);
+    await fs.writeFile(path, before);
+    await validateRemotionComposition({ dir: root, phase: "plan", manifest, audit });
+  }
+  await assert.rejects(validateRemotionComposition({ dir: root, phase: "render", manifest, audit }), /合成记录/);
+  project.artifacts = saved.artifacts; project.editor = saved.editor; project.plan = saved.plan;
+  assert.equal((await prepareWorkspace(project, "render")).dir, root);
+  const undersized = await client.callTool({ name: "compose_remotion_video", arguments: { baseVideo: "base-preview.mp4", phase: "render" } });
+  assert.equal(undersized.isError, true, "low-resolution previews must not be exported as full-resolution finals");
+  const renderResponse = await client.callTool({ name: "compose_remotion_video", arguments: { baseVideo: "base.mp4", phase: "render" } });
+  assert.ok(!renderResponse.isError, JSON.stringify(renderResponse));
+  const final = JSON.parse(renderResponse.content.find((item) => item.type === "text").text);
+  assert.equal(final.width, 640); assert.equal(final.height, 360);
+  assert.equal(final.designSha256, result.designSha256, "full-resolution export must use the same approved design");
+  const finalManifest = { ...manifest, phase: "render", main: final.outputPath };
+  const finalAudit = (await fs.readFile(auditPath, "utf8")).trim().split("\n").map(JSON.parse);
+  await validateRemotionComposition({ dir: root, phase: "render", manifest: finalManifest, audit: finalAudit, approvedDesignSha256: result.designSha256 });
+  await assert.rejects(validateRemotionComposition({ dir: root, phase: "render", manifest: finalManifest, audit: finalAudit, approvedDesignSha256: "changed-design" }), /设计.*不一致/);
+  for (const timeSeconds of [0.2, 0.8, 1.5]) {
+    const frame = await client.callTool({ name: "view_frame", arguments: { video: final.outputPath, timeSeconds } });
+    assert.ok(!frame.isError && frame.content.some((item) => item.type === "image"));
+  }
+  await fs.writeFile(join(control, "tools-render.jsonl"), await fs.readFile(auditPath));
+  await fs.writeFile(join(control, "session-render.json"), JSON.stringify({ sessionId: "fixture", costUsd: 0 }));
+  await fs.writeFile(join(root, "manifest.json"), JSON.stringify(finalManifest));
+  const finalSaved = await saveAgentOutput(project, "render", root, runId, { sessionId: "fixture", costUsd: 0 });
+  assert.equal(finalSaved.editor.version, saved.editor.version);
+  assert.equal(finalSaved.artifacts.find((item) => item.kind === "video").version, 2);
+  await fs.access(join(projectDir, "artifacts", saved.artifacts.find((item) => item.kind === "preview").name));
+  project.artifacts = [...saved.artifacts, ...finalSaved.artifacts]; project.editor = finalSaved.editor; project.qc = finalSaved.qc; project.status = "completed";
+  await fs.writeFile(join(projectDir, "project.json"), JSON.stringify(project));
+  const socket = createServer();
+  await new Promise((done) => socket.listen(0, "127.0.0.1", done));
+  const port = socket.address().port;
+  await new Promise((done) => socket.close(done));
+  apiProcess = spawn(process.execPath, [resolve("server/index.mjs")], { cwd: process.cwd(), env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", WAYNE_STORAGE_DIR: storageRoot, WAYNE_IGNORE_DOTENV: "1" }, stdio: "ignore" });
+  const apiBase = `http://127.0.0.1:${port}`;
+  let apiReady = false;
+  for (let i = 0; i < 100; i++) { try { if ((await fetch(`${apiBase}/api/health`)).ok) { apiReady = true; break; } } catch {} await new Promise((done) => setTimeout(done, 50)); }
+  assert.ok(apiReady, "isolated API must start");
+  const registered = await fetch(`${apiBase}/api/projects/main-fixture`).then((response) => response.json());
+  const video = registered.artifacts.find((item) => item.kind === "preview");
+  const download = await fetch(apiBase + video.url);
+  assert.equal(download.status, 200);
+  assert.equal(createHash("sha256").update(Buffer.from(await download.arrayBuffer())).digest("hex"), result.sha256.output);
+  const range = await fetch(apiBase + video.url, { headers: { Range: "bytes=0-1023" } });
+  assert.equal(range.status, 206); assert.equal((await range.arrayBuffer()).byteLength, 1024);
+  const registeredFinal = registered.artifacts.find((item) => item.kind === "video");
+  const finalDownload = await fetch(apiBase + registeredFinal.url);
+  assert.equal(finalDownload.status, 200);
+  assert.equal(createHash("sha256").update(Buffer.from(await finalDownload.arrayBuffer())).digest("hex"), final.sha256.output);
+  const escaped = await client.callTool({ name: "compose_remotion_video", arguments: { baseVideo: "../outside.mp4", phase: "render" } });
+  assert.equal(escaped.isError, true);
+  assert.match(escaped.content.find((item) => item.type === "text").text, /workspace|inside/i);
+  console.log("remotion-main-tools.verify: cut main preview, full-resolution matching export, retained audio/source and stale-evidence rejection passed");
+} finally { if (apiProcess && apiProcess.exitCode === null) { apiProcess.kill("SIGTERM"); await new Promise((done) => apiProcess.once("close", done)); } await client.close().catch(() => {}); await transport.close().catch(() => {}); await fs.rm(storageRoot, { recursive: true, force: true }); }

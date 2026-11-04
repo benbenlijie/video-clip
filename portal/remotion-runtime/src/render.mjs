@@ -26,7 +26,7 @@ function validateInput(value) {
   }
   if (value.width < 16 || value.height < 16 || value.width > 7680 || value.height > 7680) throw new Error("Overlay dimensions are outside the supported range");
   if (value.durationMs < 1 || value.durationMs > 60 * 60 * 1000 || value.fps < 1 || value.fps > 120) throw new Error("Overlay duration or frame rate is outside the supported range");
-  if (!Array.isArray(value.events) || value.events.length > 32) throw new Error("Overlay events must be an array with at most 32 items");
+  if (!Array.isArray(value.events) || value.events.length > 256) throw new Error("Overlay events must be an array with at most 256 items");
   for (const [index, event] of value.events.entries()) {
     if (!event || !["title_card", "emphasis", "cta"].includes(event.type)) throw new Error(`Unsupported overlay event type at index ${index}`);
     if (!Number.isFinite(event.startMs) || !Number.isFinite(event.endMs) || event.startMs < 0 || event.endMs <= event.startMs || event.endMs > value.durationMs) throw new Error(`Invalid overlay event range at index ${index}`);

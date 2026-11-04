@@ -10,7 +10,7 @@
     "dev:all": "node server/index.mjs & vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
-    "verify": "node server/edit-plan.verify.mjs && node server/edit-chat.verify.mjs && node server/broll-search.verify.mjs && node server/timeline-contract.verify.mjs && node server/openchatcut-sidecar.verify.mjs && node server/engine-adapters.verify.mjs && node server/hyperframes.verify.mjs && node server/render.verify.mjs && node server/music.verify.mjs && node server/video-agent-tools.verify.mjs && node server/video-broll-tools.verify.mjs && node server/claude-code-editor.verify.mjs",
+    "verify": "node server/local-whisper.verify.mjs && node server/transcription.verify.mjs && node server/transcription-route.verify.mjs && node server/transcript-proofreading.verify.mjs && node server/transcript-review.verify.mjs && node server/transcript-review-route.verify.mjs && node server/edit-plan.verify.mjs && node server/edit-chat.verify.mjs && node server/broll-search.verify.mjs && node server/timeline-contract.verify.mjs && node server/openchatcut-sidecar.verify.mjs && node server/engine-adapters.verify.mjs && node server/hyperframes.verify.mjs && node server/render.verify.mjs && node server/music.verify.mjs && node server/video-agent-tools.verify.mjs && node server/video-broll-tools.verify.mjs && node server/claude-code-editor.verify.mjs && node server/claude-remotion-tools.verify.mjs",
     "verify:remotion": "npm --prefix remotion-runtime run verify && node server/remotion-overlay.verify.mjs && node server/claude-remotion-tools.verify.mjs && node server/engine-adapters.verify.mjs"
   },
   "dependencies": {

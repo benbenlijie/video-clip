@@ -8,8 +8,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { providerState, transcribeVideo } from "./transcription.mjs";
+import { getWhisperConfig } from "./local-whisper.mjs";
 import { createProjectStore } from "./project-store.mjs";
 import { writeTranscriptArtifacts } from "./edit-plan.mjs";
+import { applyTranscriptReview, ensureTranscriptReviewState } from "./transcript-review.mjs";
+import { subtitlesMatchTranscript, transcriptFingerprint } from "./transcript-proofreading.mjs";
 import { editWithClaudeCode, editorState } from "./claude-code-editor.mjs";
 import { brollProviderState, searchOnlineBroll } from "./broll-search.mjs";
 import { appendEditTurn, buildChatContext, completeEditTurn, createEditSession, failEditTurn } from "./edit-chat.mjs";
@@ -21,7 +24,7 @@ import { listOpenChatCutProjects, probeOpenChatCut } from "./openchatcut-sidecar
 try {
   if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
   const envText = await fs.readFile(new URL("../.env", import.meta.url), "utf8");
-  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE"]);
+  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE", "WAYNE_WHISPER_CLI_PATH", "WAYNE_WHISPER_MODEL_PATH", "WAYNE_WHISPER_THREADS", "WAYNE_WHISPER_TIMEOUT_MS"]);
   for (const line of envText.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
     if (match && portalKeys.has(match[1])) process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
@@ -32,6 +35,7 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const store = createProjectStore(resolve(process.env.WAYNE_STORAGE_DIR || join(root, "storage")));
 const subscribers = new Map();
 const brollSearchRequests = new Map();
+const activeTranscriptions = new Set();
 const editorRuntime = editorState();
 const engineAvailability = getEngineAvailability({ remotion: await remotionRuntimeAvailable() });
 let openchatcutAvailability = { ...engineAvailability.openchatcut };
@@ -73,6 +77,7 @@ async function sha256File(path) {
 
 function configState() {
   const transcription = providerState();
+  const whisper = getWhisperConfig();
   const anthropic = Boolean(process.env.ANTHROPIC_API_KEY || process.env.LLM_ANTHROPIC_API_KEY);
   const allConfigured = anthropic && transcription.any && editorRuntime.available;
   return {
@@ -82,6 +87,7 @@ function configState() {
     transcriptionProvider: transcription.provider,
     volcengine: transcription.volcengine,
     tencent: transcription.tencent,
+    localWhisper: { available: whisper.available, model: whisper.model, threads: whisper.threads },
     ffmpeg: true,
     engines: availableEngines(),
     brollProviders: brollProviderState(),
@@ -302,21 +308,59 @@ async function serveFile(req, res, path, contentType, disposition = "inline") {
 
 async function createProject(body = {}) {
   const id = randomUUID();
-  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, plan: null, qc: null, error: null, upload: null, editSession: null };
+  const project = { id, workflowId: "wayne-video-editing", status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, transcription: null, proofreading: null, plan: null, qc: null, error: null, upload: null, editSession: null };
   await save(project);
   return project;
 }
 
 async function transitionToTranscript(project) {
   if (!project.media) throw new Error("请先上传视频");
+  if (activeTranscriptions.has(project.id)) throw Object.assign(new Error("云端 ASR 与本地 Whisper 正在并行识别，请稍候"), { statusCode: 409 });
   if (!configState().transcription) { project.status = "needs_input"; project.error = "未配置火山引擎或腾讯云转录凭证"; await save(project); throw Object.assign(new Error(project.error), { statusCode: 409, status: project.status }); }
-  project.status = "transcribing"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "正在调用转录服务" });
+  activeTranscriptions.add(project.id);
+  const whisperConfig = getWhisperConfig();
+  const startedAt = new Date().toISOString();
+  project.status = "transcribing";
+  project.error = null;
+  project.transcription = {
+    status: "running",
+    model: whisperConfig.available ? whisperConfig.model : null,
+    primary: { status: "running" },
+    secondary: { status: whisperConfig.available ? "running" : "unavailable", ...(whisperConfig.available ? {} : { error: "本地 Whisper CLI 或 small 模型未安装" }) },
+    startedAt,
+  };
+  await save(project);
+  publish(project.id, { type: "stage", status: project.status, message: "云端 ASR 与本地 Whisper 正在并行识别" });
   try {
-    const result = await transcribeVideo({ videoPath: project.media.path, projectDir: project.dir, projectId: project.id });
-    project.transcript = { provider: result.provider, requestId: result.requestId, ...result.transcript };
+    const result = await transcribeVideo({
+      videoPath: project.media.path,
+      projectDir: project.dir,
+      projectId: project.id,
+      onPass: ({ pass, status, error }) => {
+        const key = pass === "primary" ? "primary" : "secondary";
+      project.transcription = { ...project.transcription, [key]: { status, ...(error ? { error } : {}) }, updatedAt: new Date().toISOString() };
+      project.status = "transcribing";
+      publish(project.id, { type: "transcription_pass", pass, status, message: pass === "primary" ? "云端 ASR" : "本地 Whisper", error });
+      },
+    });
+    project.transcription = {
+      status: result.primary ? (result.secondaryStatus === "complete" ? "ready" : "manual_review_required") : "failed",
+      audioSha256: result.audioSha256,
+      model: result.model,
+      primary: { status: result.primaryStatus, ...(result.primary ? { provider: result.primary.provider, requestId: result.primary.requestId } : {}), ...(result.primaryError ? { error: result.primaryError } : {}) },
+      secondary: { status: result.secondaryStatus, ...(result.secondary ? { provider: result.secondary.provider, model: result.secondary.model, elapsedMs: result.secondary.elapsedMs } : {}), ...(result.secondaryError ? { error: result.secondaryError } : {}) },
+      startedAt,
+      completedAt: new Date().toISOString(),
+    };
+    project.secondaryTranscript = result.secondary || null;
+    if (!result.primary) throw new Error(result.primaryError || "云端 ASR 未返回转录结果");
+    project.transcript = { provider: result.primary.provider, requestId: result.primary.requestId, ...result.primary.transcript };
+    project.primaryTranscript = structuredClone(project.transcript);
+    project.proofreading = result.secondary ? null : { status: "manual_review_required", model: result.model, changes: [], unresolved: [] };
     await writeTranscriptArtifacts(project, project.transcript);
-    project.status = "transcript_ready"; await save(project); publish(project.id, { type: "stage", status: project.status, message: `转录完成（${result.provider}）` });
-  } catch (error) { project.status = "failed"; project.error = error.message; await save(project); publish(project.id, { type: "failed", status: project.status, message: error.message }); throw error; }
+    project.status = "transcript_ready"; await save(project); publish(project.id, { type: "stage", status: project.status, message: `并行识别完成（${result.primary.provider}${result.secondary ? " + Whisper small" : "；需人工校对"}）` });
+  } catch (error) { project.transcription = { ...project.transcription, status: "failed", completedAt: new Date().toISOString() }; project.status = "failed"; project.error = error.message; await save(project); publish(project.id, { type: "failed", status: project.status, message: error.message }); throw error; }
+  finally { activeTranscriptions.delete(project.id); }
 }
 
 async function transitionToPlan(project) {
@@ -416,7 +460,42 @@ async function handle(req, res) {
 
   const project = segments[0] === "api" && segments[1] === "projects" ? store.get(segments[2]) : null;
   if (!project) return json(res, 404, { error: "project not found" });
+  ensureTranscriptReviewState(project);
   if (req.method === "GET" && segments.length === 3) return json(res, 200, projectView(project));
+  if (req.method === "GET" && segments[3] === "transcript-audio") {
+    try { return serveFile(req, res, join(project.dir, "transcript-audio.wav"), "audio/wav"); }
+    catch { return json(res, 404, { error: "transcript audio not found" }); }
+  }
+  if (req.method === "POST" && segments[3] === "transcript") {
+    if (["transcribing", "planning", "rendering", "chat_editing"].includes(project.status)) return json(res, 409, { error: "当前识别或剪辑任务仍在运行，暂时不能修改字幕" });
+    if (!project.transcript || !project.proofreading) return json(res, 409, { error: "该项目还没有可审阅的转录稿" });
+    try {
+      const body = await readJson(req);
+      const result = applyTranscriptReview({
+        transcript: project.transcript,
+        proofreading: project.proofreading,
+        segments: body.segments,
+        confirmedUnresolvedSegmentIds: body.confirmedUnresolvedSegmentIds,
+      });
+      const nextProofreading = { ...result.proofreading, previewTranscriptSha256: project.proofreading.previewTranscriptSha256 || null };
+      nextProofreading.previewStale = Boolean(project.plan && nextProofreading.previewTranscriptSha256 !== transcriptFingerprint(result.transcript));
+      if (project.proofreading.migrated) {
+        try { await fs.writeFile(join(project.dir, "transcript.original.json"), JSON.stringify(project.primaryTranscript, null, 2), { flag: "wx" }); }
+        catch (error) { if (error.code !== "EEXIST") throw error; }
+        nextProofreading.migrated = false;
+      }
+      await fs.writeFile(join(project.dir, "transcript.reviewed.json"), JSON.stringify(result.transcript, null, 2));
+      await writeTranscriptArtifacts(project, result.transcript);
+      project.transcript = result.transcript;
+      project.proofreading = nextProofreading;
+      project.qc = null;
+      project.status = project.plan ? "preview_ready" : "transcript_ready";
+      project.error = null;
+      await save(project);
+      publish(project.id, { type: "transcript_reviewed", status: project.status, message: project.proofreading.previewStale ? "字幕校对已保存；预览字幕需要重新生成" : "字幕校对已确认" });
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, 400, { error: error.message, status: project.status }); }
+  }
   if (req.method === "GET" && segments[3] === "timeline") {
     if (!project.media || !project.plan) return json(res, 409, { error: "生成标准时间线需要已上传媒体和剪辑计划", status: project.status });
     try { return json(res, 200, toTimelineV1(project)); }
@@ -612,7 +691,7 @@ async function handle(req, res) {
   if (req.method === "POST" && segments[3] === "advance") {
     try {
       if (["planning", "rendering"].includes(project.status)) throw Object.assign(new Error("Claude Code 正在处理中，请等待本轮完成"), { statusCode: 409 });
-      if (project.status === "inspecting" || (project.status === "needs_input" && !project.transcript) || (project.status === "failed" && project.media && !project.transcript)) await transitionToTranscript(project);
+      if (project.status === "inspecting" || project.status === "transcribing" || (project.status === "needs_input" && !project.transcript) || (project.status === "failed" && project.media && !project.transcript)) await transitionToTranscript(project);
       else if (project.status === "failed" && project.plan) { project.status = "preview_ready"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "保留现有计划，可重新渲染" }); }
       else if (project.status === "transcript_ready" || (project.status === "needs_input" && project.transcript && !project.plan) || (project.status === "failed" && project.transcript && !project.plan)) await transitionToPlan(project);
       else if (project.status === "plan_ready" || project.status === "awaiting_review") { project.status = "preview_ready"; await save(project); publish(project.id, { type: "stage", status: project.status, message: "计划已确认，可预览并批注" }); }
@@ -647,6 +726,8 @@ async function handle(req, res) {
   if (req.method === "POST" && segments[3] === "render") {
     if (!project.plan) return json(res, 409, { error: "请先生成并确认剪辑计划", status: project.status });
     if (["planning", "rendering"].includes(project.status)) return json(res, 409, { error: "Claude Code 正在处理中，请等待本轮完成" });
+    if (["needs_review", "manual_review_required"].includes(project.proofreading?.status)) return json(res, 409, { error: "字幕仍有待确认内容，请先完成字幕校对", status: project.status });
+    if (project.proofreading?.previewStale || (project.proofreading?.previewTranscriptSha256 && project.proofreading.previewTranscriptSha256 !== transcriptFingerprint(project.transcript))) return json(res, 409, { error: "字幕已修改，预览字幕尚未更新；请先在对话中让 Claude 重新生成预览", status: project.status });
     if (project.editor?.engine !== "claude-code" || !project.editor.runId) return json(res, 409, { error: "这是旧版模板计划，请先重新生成 Claude Code 工程和预览", status: project.status });
     project.status = "rendering"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code / Opus 5.5 正在执行工程、审片并修正" });
     try { const result = await editWithClaudeCode(project, "render", editorProgress(project)); project.plan = result.plan; project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])]; project.editor = result.editor; project.artifacts = [...(project.artifacts || []), ...result.artifacts]; project.qc = result.qc; project.status = "completed"; await save(project); publish(project.id, { type: "stage", status: project.status, message: "Claude Code 已导出并抽帧审阅，请观看成片验收" }); return json(res, 200, projectView(project)); } catch (error) { project.status = "failed"; project.error = error.message; await save(project); publish(project.id, { type: "failed", status: project.status, message: error.message }); return json(res, 502, { error: error.message, status: project.status }); }

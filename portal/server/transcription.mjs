@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { getWhisperConfig, transcribeWithWhisper, whisperRuntimeFingerprint } from "./local-whisper.mjs";
 
 function config() {
   return {
@@ -164,10 +166,11 @@ async function transcribeTencent(audioBytes) {
   throw new Error("腾讯云 ASR 任务轮询超时");
 }
 
-export async function transcribeVideo({ videoPath, projectDir, projectId }) {
+export async function transcribeVideo({ videoPath, projectDir, projectId, onPass = () => undefined }) {
   const audioPath = `${projectDir}/transcript-audio.wav`;
   const audio = await extractAudio(videoPath, audioPath);
-  const cfg = config(); const state = providerState(); const errors = [];
+  const cfg = config(); const state = providerState();
+  const audioSha256 = sha256(audio);
   const standardAudioUrl = cfg.volcengine.publicBaseUrl ? `${cfg.volcengine.publicBaseUrl.replace(/\/$/, "")}/media/${projectId}/transcript-audio.wav` : "";
   const tryVolc = cfg.provider !== "tencent" && state.volcengine;
   const tryTencent = state.tencent;
@@ -177,12 +180,96 @@ export async function transcribeVideo({ videoPath, projectDir, projectId }) {
     if (state.volcengineFast) attempts.push(() => transcribeVolcengineFast(audio));
   }
   if (tryTencent) attempts.push(() => transcribeTencent(audio));
+  const whisper = getWhisperConfig();
+  const primaryCache = join(projectDir, "transcript.original.json");
+  const whisperCache = join(projectDir, "transcript.whisper.json");
+  const primaryModel = `cloud-${sha256(JSON.stringify({ provider: cfg.provider, volcengineMode: cfg.volcengine.mode, volcengineResourceId: cfg.volcengine.resourceId, volcengineModel: cfg.volcengine.model, volcengineBaseUrl: cfg.volcengine.baseUrl, tencentEngine: cfg.tencent.engine, tencentEndpoint: cfg.tencent.endpoint, standardEnabled: state.volcengineStandard, fastEnabled: state.volcengineFast, tencentEnabled: state.tencent }))}`;
+  const cachedPrimary = await readRecognitionPassCache(primaryCache, { audioSha256, model: primaryModel });
+  const whisperRuntimeHash = whisper.available ? await whisperRuntimeFingerprint(whisper) : null;
+  const cachedWhisper = whisper.available
+    ? await readRecognitionPassCache(whisperCache, { audioSha256, model: whisper.model, runtimeFingerprint: whisperRuntimeHash })
+    : null;
+  const passes = await runRecognitionPasses({
+    cloud: async () => {
+      if (cachedPrimary) return cachedPrimary.transcript;
+      const result = await runPrimaryAttempts(attempts);
+      const primary = { provider: result.provider, requestId: result.requestId, transcript: result.transcript };
+      await writeRecognitionPassCache(primaryCache, { audioSha256, model: primaryModel, transcript: primary });
+      return primary;
+    },
+    local: async () => {
+      if (!whisper.available) return null;
+      if (cachedWhisper) return cachedWhisper.transcript;
+      const transcript = await transcribeWithWhisper({ audioPath, config: whisper });
+      await writeRecognitionPassCache(whisperCache, { audioSha256, model: whisper.model, runtimeFingerprint: whisperRuntimeHash, transcript });
+      return transcript;
+    },
+    onPass,
+  });
+  return {
+    primary: passes.primary,
+    secondary: passes.secondary,
+    primaryStatus: passes.primaryStatus,
+    secondaryStatus: whisper.available ? passes.secondaryStatus : "unavailable",
+    primaryError: passes.primaryError || (attempts.length ? undefined : "未配置火山引擎或腾讯云转录凭证"),
+    secondaryError: whisper.available ? passes.secondaryError : "本地 Whisper CLI 或 small 模型未安装",
+    model: whisper.available ? whisper.model : null,
+    audioSha256,
+    audioPath,
+  };
+}
+
+export async function runPrimaryAttempts(attempts) {
+  const errors = [];
   for (const attempt of attempts) {
-    try {
-      const result = await attempt();
-      await fs.writeFile(`${projectDir}/transcript.json`, JSON.stringify({ ...result.transcript, provider: result.provider, requestId: result.requestId }, null, 2));
-      return result;
-    } catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+    try { return await attempt(); }
+    catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
   }
   throw new Error(errors.length ? `转录服务失败：${errors.join("；")}` : "未配置火山引擎或腾讯云转录凭证");
+}
+
+export async function runRecognitionPasses({ cloud, local, onPass = () => undefined }) {
+  const notify = (event) => { try { onPass(event); } catch { /* Progress observers must not fail recognition. */ } };
+  const run = async (pass, operation) => {
+    notify({ pass, status: "running" });
+    try {
+      const result = await operation();
+      const status = result == null ? "unavailable" : "complete";
+      notify({ pass, status });
+      return { status, result };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      notify({ pass, status: "failed", error: message });
+      return { status: "failed", result: null, error: message };
+    }
+  };
+  const [primary, secondary] = await Promise.all([run("primary", cloud), run("secondary", local)]);
+  return {
+    primary: primary.result,
+    secondary: secondary.result,
+    primaryStatus: primary.status,
+    secondaryStatus: secondary.status,
+    primaryError: primary.error,
+    secondaryError: secondary.error,
+  };
+}
+
+export async function readRecognitionPassCache(path, { audioSha256, model, runtimeFingerprint }) {
+  try {
+    const cached = JSON.parse(await fs.readFile(path, "utf8"));
+    const runtimeMatches = runtimeFingerprint === undefined || cached.runtimeFingerprint === runtimeFingerprint;
+    return cached.audioSha256 === audioSha256 && cached.model === model && runtimeMatches && cached.transcript ? cached : null;
+  } catch { return null; }
+}
+
+export async function writeRecognitionPassCache(path, { audioSha256, model, runtimeFingerprint, transcript }) {
+  await fs.mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify({ audioSha256, model, ...(runtimeFingerprint ? { runtimeFingerprint } : {}), transcript }, null, 2), { flag: "wx" });
+    await fs.rename(temporary, path);
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }

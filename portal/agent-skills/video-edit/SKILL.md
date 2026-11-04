@@ -36,6 +36,8 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 读取逐词时间戳：忽略负时间的占位项，保留完整单词和完整语义。删除停顿、口误和明显重录，但不要为了追求快而切碎句子。ASR 不确定时保留原词或在报告中标注，不得编造事实。
 
+计划阶段收到 `transcript.original.json` 和 `transcript.whisper.json` 时，在同一次计划调用中比较两份 ASR 文本并输出 `transcript-proofread.json`。Claude Code CLI 不能直接听音频：不得声称已听音；每项更正必须引用 primary、whisper 或 both 文本证据。无法从两份识别稿支持的分歧记入 unresolved，保留原始台词，不得按语境猜词。保留原稿、第二稿和来源时间戳；将校对稿同步写入 `transcript.json`。若没有 Whisper 第二稿，原文不变并标记 `manual_review_required`。
+
 ### 2. 建立 beat map
 
 先按 `.claude/skills/video-edit/references/editorial-grammar.md` 写出内部 beat map：`hook`、`teaser`、`context`、`proof`、`payoff`、`brand`、`cta`，并为每段选择 `FULL`、`PUNCH_IN`、`SPLIT`、`BROLL_COVER` 或 `TEASER` 镜头角色。节奏由语义和能量决定，禁止机械地每秒切一次。

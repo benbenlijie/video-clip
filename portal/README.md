@@ -69,6 +69,8 @@ TENCENTCLOUD_REGION=ap-guangzhou
 
 当前 API 默认运行在 `http://127.0.0.1:18787`，读取这些配置并显示配置状态。项目会持久化到 `portal/storage/<projectId>/project.json`，媒体和产物保存在同一项目目录。标准版转录会提交任务并轮询结果；未配置时 API 会返回 `needs_input`，不会伪造剪辑完成。视频剪辑使用本机 Claude Code CLI，以 `claude-opus-5-5` 固定模型运行，不自动降级；该 CLI 使用同一 Anthropic API Key 和可选的 `ANTHROPIC_BASE_URL`。
 
+字幕校对会在同一份 WAV 提取完成后，并行运行现有云端 ASR 和本地 Whisper.cpp。CPU 默认使用 `small-q5_1`（约 190 MB），固定禁用 GPU，默认 8 线程；Whisper 不产生逐次识别费用。火山/腾讯初次转录和原有 Claude 剪辑调用仍按原服务计费。把 whisper.cpp v1.9.2 Linux x64 CLI 整个发行目录（保留旁边的共享库）放到 `portal/storage/whisper/bin/`，把 `ggml-small-q5_1.bin` 放到 `portal/storage/whisper/models/`；该目录已被忽略，不会进入 Git。默认路径自动发现，也可通过 `WAYNE_WHISPER_CLI_PATH` 与 `WAYNE_WHISPER_MODEL_PATH` 覆盖。Whisper 缺失或失败不会丢弃成功的云端转录，会转入人工校对提示。
+
 ### Claude Code 媒体编辑器
 
 剪辑阶段会在项目中加载 `agent-skills/video-edit/SKILL.md`。Opus 检查旋转、音轨、真实原片帧和逐词转录，自主决定是否需要 B-roll；需要时通过受限 MCP 搜索 Pexels/Pixabay、查看候选缩略图、自动下载最多 3 条素材，并把实际来源、许可信息、SHA-256 和插入时间写入工程。随后它编写字幕、剪辑脚本、HyperFrames 工程（按需）与低清预览；批注后继续修改同一工程、导出终稿并重新查看成片抽帧。短样例可以没有额外 Shorts、标题卡或 CTA。媒体 shell 保持断网，任意 URL、外域重定向、超大或无效媒体都会被拒绝。

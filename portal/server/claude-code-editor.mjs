@@ -5,7 +5,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { probeOutput, detectBlackFrames } from "./render.mjs";
-import { validateEditPlan } from "./edit-plan.mjs";
+import { transcriptToSrt, validateEditPlan } from "./edit-plan.mjs";
+import { subtitlesMatchTranscript, transcriptFingerprint, validateProofreadResult } from "./transcript-proofreading.mjs";
 import { workspacePath } from "./video-agent-tools.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -72,7 +73,15 @@ export async function prepareWorkspace(project, phase, options = {}) {
     }
     await fs.writeFile(join(dir, "assets.json"), JSON.stringify({ broll: assets, music: project.music ? { path: `music${extname(project.music.path)}`, licenseConfirmed: project.music.licenseConfirmed } : null }, null, 2));
   }
+  const originalCache = await fs.readFile(join(projectDir, "transcript.original.json"), "utf8").catch(() => "");
+  let originalTranscript = project.transcript;
+  if (originalCache) {
+    try { originalTranscript = JSON.parse(originalCache).transcript || JSON.parse(originalCache); } catch { /* Old project cache: fall back to the active transcript. */ }
+  }
   await fs.writeFile(join(dir, "transcript.json"), JSON.stringify(project.transcript, null, 2));
+  await fs.writeFile(join(dir, "transcript.original.json"), JSON.stringify(originalTranscript, null, 2));
+  if (project.secondaryTranscript) await fs.writeFile(join(dir, "transcript.whisper.json"), JSON.stringify(project.secondaryTranscript, null, 2));
+  if (project.proofreading) await fs.writeFile(join(dir, "transcript-proofread.json"), JSON.stringify(project.proofreading, null, 2));
   await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, projectId: project.id, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: ["render", "chat-edit"].includes(phase) ? project.plan : undefined, chatTurn: options.chatTurn || undefined, chatContext: options.chatContext || undefined, latestVersion: project.editSession?.latestVersion || project.editor?.version || 1 }, null, 2));
   return { dir, runId };
 }
@@ -125,7 +134,10 @@ export function buildEditorPrompt(phase) {
   const remotionInstruction = ["plan", "chat-edit"].includes(phase)
     ? "After edit-plan.json is stable, use mcp__video__render_remotion_preview for one comparison render when the Remotion runtime is available. Inspect at least two moments in its returned preview with mcp__video__view_frame. Use a second comparison render only after changing visualEvents. This is a separate design comparison; do not claim it is the normal Wayne preview or final export. If the tool fails, record the reason and continue with the standard Wayne preview."
     : "Do not create an additional Remotion comparison during the final export phase.";
-  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, transcript.json and assets.json. Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Implement the edit yourself; do not just describe a plan. Read the HyperFrames skill when using that tool. Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Use HyperFrames for at least one executable animated overlay or transition in every plan when the runtime is available. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. ${remotionInstruction} End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
+  const proofreadingInstruction = phase === "plan"
+    ? "Before finalizing the plan, read transcript.original.json and transcript.whisper.json if present. Claude Code cannot directly hear the audio, so compare the two ASR texts only; do not claim to have listened. Correct a segment only when the replacement is supported by one or both transcript sources. Write transcript-proofread.json with status ready, needs_review, or manual_review_required; include corrected transcript segments, every text change with evidence (primary, whisper, or both) and reason, and every unresolved disagreement with the exact primary/Whisper text. Keep ids and source timestamps unchanged. Never invent words from context. Update transcript.json to the corrected transcript. If Whisper is missing, keep the primary text unchanged and set manual_review_required. Continue with the edit plan in this same Claude session; do not start another Claude session for proofreading."
+    : "Use the current transcript.json as the authoritative approved text. Do not alter spoken words unless the user requests a transcript correction.";
+  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, transcript.json, transcript.original.json, transcript.whisper.json if present, and assets.json. ${proofreadingInstruction} Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Implement the edit yourself; do not just describe a plan. Read the HyperFrames skill when using that tool. Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Use HyperFrames for at least one executable animated overlay or transition in every plan when the runtime is available. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. ${remotionInstruction} End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
 }
 
 export async function validateAgentOutput(dir, phase) {
@@ -135,6 +147,20 @@ export async function validateAgentOutput(dir, phase) {
   if (extname(mainPath) !== ".mp4") throw new Error("主视频必须是 MP4");
   const probe = await probeOutput(mainPath);
   const brief = JSON.parse(await fs.readFile(await workspacePath(dir, "brief.json"), "utf8"));
+  const transcript = JSON.parse(await fs.readFile(await workspacePath(dir, "transcript.json"), "utf8"));
+  let proofreading = null;
+  if (phase === "plan") {
+    const original = JSON.parse(await fs.readFile(await workspacePath(dir, "transcript.original.json"), "utf8"));
+    let secondary = null;
+    try { secondary = JSON.parse(await fs.readFile(await workspacePath(dir, "transcript.whisper.json"), "utf8")); } catch { /* The local second pass is optional. */ }
+    const proofreadFile = await workspacePath(dir, "transcript-proofread.json");
+    const proofread = JSON.parse(await fs.readFile(proofreadFile, "utf8"));
+    proofreading = validateProofreadResult(proofread, original, secondary);
+    const activeMatches = transcript.segments?.length === proofreading.transcript.segments.length
+      && transcript.segments.every((segment, index) => segment.id === proofreading.transcript.segments[index].id && segment.startMs === proofreading.transcript.segments[index].startMs && segment.endMs === proofreading.transcript.segments[index].endMs && segment.text === proofreading.transcript.segments[index].text)
+      && transcript.text === proofreading.transcript.text;
+    if (!activeMatches) throw new Error("工作区 transcript.json 与校对稿不一致");
+  }
   const hash = createHash("sha256").update(await fs.readFile(mainPath)).digest("hex");
   const audit = (await fs.readFile(join(controlDir(dir), `tools-${phase}.jsonl`), "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const frames = audit.filter((event) => event.tool === "view_frame" && event.video === manifest.main && event.sha256 === hash && !event.error);
@@ -145,9 +171,15 @@ export async function validateAgentOutput(dir, phase) {
   const blackFrames = await detectBlackFrames(mainPath);
   if (blackFrames.length) throw new Error("成片存在持续黑帧，需要 Claude Code 修正");
   if (!Array.isArray(manifest.sources) || !manifest.sources.length) throw new Error("缺少可编辑工程源码");
-  const subtitle = await workspacePath(dir, manifest.subtitle);
-  if (extname(subtitle) !== ".srt" || !(await fs.readFile(subtitle, "utf8")).includes("-->")) throw new Error("缺少最终时间线字幕");
-  const files = [{ path: manifest.main, kind: ["plan", "chat-edit"].includes(phase) ? "preview" : "video", ...probe }, { path: manifest.subtitle, kind: "subtitle" }];
+  const subtitle = manifest.subtitle ? await workspacePath(dir, manifest.subtitle) : null;
+  if (subtitle && (extname(subtitle) !== ".srt" || !(await fs.readFile(subtitle, "utf8")).includes("-->"))) throw new Error("缺少最终时间线字幕");
+  if (!subtitle && !(manifest.subtitleNote && transcript.text === "")) throw new Error("缺少最终时间线字幕");
+  if (subtitle) {
+    const subtitleText = await fs.readFile(subtitle, "utf8");
+    const editPlan = JSON.parse(await fs.readFile(await workspacePath(dir, "edit-plan.json"), "utf8"));
+    if (!subtitlesMatchTranscript(subtitleText, transcript, editPlan)) throw new Error("字幕文字与当前校对转录不一致");
+  }
+  const files = [{ path: manifest.main, kind: ["plan", "chat-edit"].includes(phase) ? "preview" : "video", ...probe }, ...(subtitle ? [{ path: manifest.subtitle, kind: "subtitle" }] : [])];
   const currentPlanSha256 = await sha256File(await workspacePath(dir, "edit-plan.json"));
   const currentSourceSha256 = await sha256File(await workspacePath(dir, "input.mp4"));
   const remotionComparisons = [];
@@ -194,11 +226,18 @@ export async function validateAgentOutput(dir, phase) {
     if (shortProbe.width !== 1080 || shortProbe.height !== 1920) throw new Error("Shorts 必须为 1080×1920");
     files.push({ ...short, kind: "short", ...shortProbe });
   }
-  return { manifest, files, qc: { passed: true, main: probe, engine: "claude-code", model: EDITOR_MODEL, subtitlesBurnedIn: true, audioVideoSyncChecked: true, noUnexpectedBlackFrames: true, visualReview: { method: "claude-code-vision", frames: frames.map(({ timeSeconds, sha256 }) => ({ timeSeconds, sha256 })), notes: manifest.review.notes }, remotionComparisons: remotionComparisons.length ? remotionComparisons : null, requiresHumanReview: true } };
+  return { manifest, files, proofreading, qc: { passed: true, main: probe, engine: "claude-code", model: EDITOR_MODEL, subtitlesBurnedIn: true, audioVideoSyncChecked: true, noUnexpectedBlackFrames: true, subtitleTextChecked: Boolean(subtitle), visualReview: { method: "claude-code-vision", frames: frames.map(({ timeSeconds, sha256 }) => ({ timeSeconds, sha256 })), notes: manifest.review.notes }, remotionComparisons: remotionComparisons.length ? remotionComparisons : null, requiresHumanReview: true } };
 }
 
 export async function saveAgentOutput(project, phase, dir, runId, receipt) {
   const output = await validateAgentOutput(dir, phase);
+  if (phase === "plan" && output.proofreading) {
+    project.transcript = { ...project.transcript, ...output.proofreading.transcript };
+    project.proofreading = { status: output.proofreading.status, model: project.transcription?.model || null, changes: output.proofreading.changes, unresolved: output.proofreading.unresolved, previewTranscriptSha256: transcriptFingerprint(project.transcript), previewStale: false };
+    await fs.writeFile(join(project.dir, "transcript.corrections.json"), JSON.stringify(project.proofreading, null, 2));
+    await fs.writeFile(join(project.dir, "transcript.json"), JSON.stringify(project.transcript, null, 2));
+    await fs.writeFile(join(project.dir, "transcript.srt"), transcriptToSrt(project.transcript));
+  }
   const planData = JSON.parse(await fs.readFile(await workspacePath(dir, "edit-plan.json"), "utf8"));
   const brollAudit = (await fs.readFile(join(controlDir(dir), "broll-audit.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const brollAssets = brollAudit.filter((entry) => entry.tool === "download_broll").map((entry) => ({ id: entry.assetId, filename: entry.filename, path: join(dir, entry.path), durationMs: entry.durationMs, width: entry.width, height: entry.height, licenseConfirmed: true, sourceUrl: entry.sourceUrl, licenseName: entry.licenseName, licenseUrl: entry.licenseUrl, sha256: entry.sha256, provider: entry.provider, providerId: entry.providerId }));
@@ -207,7 +246,7 @@ export async function saveAgentOutput(project, phase, dir, runId, receipt) {
   const artifactsDir = join(resolve(project.dir), "artifacts");
   await fs.mkdir(artifactsDir, { recursive: true });
   const artifacts = [];
-  const files = [...output.files, ...brollAssets.map((asset) => ({ path: asset.path.replace(`${dir}/`, ""), kind: "broll", assetId: asset.id, sourceUrl: asset.sourceUrl, licenseName: asset.licenseName, licenseUrl: asset.licenseUrl, provider: asset.provider, providerId: asset.providerId, sha256: asset.sha256 })), { path: "edit-plan.json", kind: "plan" }, { path: `session-${phase}.json`, kind: "agent-log", control: true }, { path: `tools-${phase}.jsonl`, kind: "agent-log", control: true }];
+  const files = [...output.files, ...brollAssets.map((asset) => ({ path: asset.path.replace(`${dir}/`, ""), kind: "broll", assetId: asset.id, sourceUrl: asset.sourceUrl, licenseName: asset.licenseName, licenseUrl: asset.licenseUrl, provider: asset.provider, providerId: asset.providerId, sha256: asset.sha256 })), { path: "edit-plan.json", kind: "plan" }, ...(phase === "plan" ? [{ path: "transcript-proofread.json", kind: "transcript-proofreading" }] : []), { path: `session-${phase}.json`, kind: "agent-log", control: true }, { path: `tools-${phase}.jsonl`, kind: "agent-log", control: true }];
   for (const [index, file] of files.entries()) {
     const name = `cc-v${version}-${phase}-${index + 1}${extname(file.path)}`;
       await fs.copyFile(file.control ? join(controlDir(dir), file.path) : resolve(dir, file.path), join(artifactsDir, name), fsConstants.COPYFILE_EXCL);
@@ -219,7 +258,10 @@ export async function saveAgentOutput(project, phase, dir, runId, receipt) {
   await fs.writeFile(join(artifactsDir, qcName), JSON.stringify(qc, null, 2), { flag: "wx" });
   artifacts.push({ name: qcName, kind: "qc", version });
   const persistedBrollAssets = brollAssets.map((asset) => ({ ...asset, path: join(artifactsDir, `cc-v${version}-${phase}-${files.findIndex((file) => file.assetId === asset.id) + 1}${extname(asset.path)}`) }));
-  return { plan, artifacts, brollAssets: persistedBrollAssets, qc, editor: { engine: "claude-code", model: EDITOR_MODEL, runId, version, phase, sessionId: receipt.sessionId, costUsd: receipt.costUsd } };
+  if (phase === "chat-edit" && project.proofreading) {
+    project.proofreading = { ...project.proofreading, previewTranscriptSha256: transcriptFingerprint(project.transcript), previewStale: false };
+  }
+  return { plan, artifacts, brollAssets: persistedBrollAssets, proofreading: output.proofreading, qc, editor: { engine: "claude-code", model: EDITOR_MODEL, runId, version, phase, sessionId: receipt.sessionId, costUsd: receipt.costUsd } };
 }
 
 export async function editWithClaudeCode(project, phase, onEvent, options = {}) {

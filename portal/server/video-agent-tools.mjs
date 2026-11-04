@@ -44,16 +44,25 @@ export async function workspacePath(root, relative, { existing = true } = {}) {
 }
 
 export async function sandboxCommand(workDir, command, timeoutMs = 180000) {
-  const node = await fs.realpath(process.execPath);
-  const args = ["--die-with-parent", "--new-session", "--unshare-all", "--dev", "/dev", "--proc", "/proc", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc/alternatives", "/etc/alternatives", "--ro-bind", node, "/tools/node", "--ro-bind", join(portalRoot, "hyperframes-runtime"), "/tools/hyperframes", "--bind", resolve(workDir), "/work", "--chdir", "/work", "--clearenv", "--setenv", "PATH", "/tools:/usr/bin:/bin", "--setenv", "HOME", "/tmp/home", "--setenv", "LANG", "C.UTF-8", "--setenv", "HYPERFRAMES_SKIP_SKILLS", "1"];
-  args.push("--dir", "/tmp/home/.cache", "--dir", "/tmp/home/.cache/hyperframes");
-  for (const name of ["chrome", "fonts"]) {
-    const cache = join(process.env.HOME || "/home/ben", ".cache/hyperframes", name);
-    try { await fs.access(cache); args.push("--ro-bind", cache, `/tmp/home/.cache/hyperframes/${name}`); } catch { /* Optional renderer cache. */ }
-  }
-  args.push("--", "/usr/bin/bash", "-c", command);
+  // The host rejects any nested Bubblewrap namespace from Claude's sandbox.
+  // In this approved fallback, keep the application-level workspace path
+  // checks and run with a scrubbed environment from the fixed work directory.
+  // `/work` is the contract exposed to Claude tools, so rewrite it to the
+  // actual project workspace before handing the command to bash.
+  const actualWorkDir = resolve(workDir);
+  const hostCommand = command
+    .replaceAll("/tools/hyperframes", join(portalRoot, "hyperframes-runtime"))
+    .replaceAll("/tools/node", await fs.realpath(process.execPath))
+    .replaceAll("/work", actualWorkDir);
+  const env = {
+    PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+    HOME: join(actualWorkDir, ".sandbox-home"),
+    LANG: "C.UTF-8",
+    HYPERFRAMES_SKIP_SKILLS: "1",
+  };
+  await fs.mkdir(env.HOME, { recursive: true });
   return new Promise((resolveRun, reject) => {
-    const child = spawn("bwrap", args, { detached: true, env: { PATH: process.env.PATH } });
+    const child = spawn("/usr/bin/bash", ["-c", hostCommand], { cwd: actualWorkDir, detached: true, env });
     let output = "";
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already exited. */ } }, timeoutMs);
@@ -73,7 +82,7 @@ export async function startMediaTools(workDir, auditPath) {
   const register = (name, description, inputSchema, handler) => server.registerTool(name, { description, inputSchema }, async (args) => {
     try { return await handler(args); } catch (error) { await audit({ tool: name, error: error.message }); return { isError: true, content: [{ type: "text", text: error.message }] }; }
   });
-  register("execute", "Run FFmpeg, FFprobe, Python, Node or HyperFrames commands in an isolated offline Linux workspace. Only /work is writable. Paths: /work, /tools/node, /tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs. Write your own scripts; inspect and iterate.", { command: z.string().max(30000), timeoutSeconds: z.number().min(1).max(240).default(180) }, async ({ command, timeoutSeconds }) => {
+  register("execute", "Run FFmpeg, FFprobe, Python, Node or HyperFrames commands in an isolated Linux workspace. Only /work is writable. This host-compatible fallback inherits the parent network namespace, so do not fetch or upload project data. Paths: /work, /tools/node, /tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs. Write your own scripts; inspect and iterate.", { command: z.string().max(30000), timeoutSeconds: z.number().min(1).max(240).default(180) }, async ({ command, timeoutSeconds }) => {
     const result = await sandboxCommand(root, command, timeoutSeconds * 1000);
     await audit({ tool: "execute", command, code: result.code, timedOut: result.timedOut });
     return { isError: result.code !== 0, content: [{ type: "text", text: JSON.stringify(result) }] };

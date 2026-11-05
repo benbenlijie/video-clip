@@ -132,6 +132,13 @@ try {
   process.env.WAYNE_WHISPER_THREADS = "4";
   await transcribeVideo({ videoPath, projectDir, projectId: "fixture-project" });
   assert.equal(await readFile(cliCount, "utf8"), "4", "thread configuration changes must invalidate the local result cache");
+
+  const assetDir = join(integrationRoot, "asset-1");
+  await (await import("node:fs/promises")).mkdir(assetDir, { recursive: true });
+  const assetAudioPath = join(assetDir, "asset-transcript-audio.wav");
+  const assetRun = await transcribeVideo({ videoPath, projectDir: assetDir, projectId: "fixture-project", audioPath: assetAudioPath, publicAudioUrl: "https://media.example.test/media/fixture-project/assets/asset-1/transcript-audio.wav" });
+  assert.equal(assetRun.audioPath, assetAudioPath, "multi-asset transcription must write audio to that asset's isolated directory");
+  assert.ok((await readFile(assetAudioPath)).length > 0, "multi-asset transcription must retain the extracted audio at its custom path");
 } finally {
   globalThis.fetch = previousFetch;
   for (const [key, value] of Object.entries(previousEnv)) {

@@ -21,6 +21,13 @@ import { createRenderManifest, getEngineAvailability, toTimelineV1 } from "./tim
 import { compositeRemotionPreview, remotionRuntimeAvailable, renderRemotionOverlay } from "./remotion-overlay.mjs";
 import { detectBlackFrames, probeOutput } from "./render.mjs";
 import { listOpenChatCutProjects, probeOpenChatCut } from "./openchatcut-sidecar.mjs";
+import { assetDir, createAssetRecord, normalizeBrief, normalizeWorkflowMode, validateAssetUpload } from "./multi-asset.mjs";
+import { toTimelineV2 } from "./timeline-v2.mjs";
+import { analyzeMultiAssetProject, buildAssetInventory } from "./multi-asset-analysis.mjs";
+import { confirmMultiAssetPlan, planMultiAssetWithClaude, restoreMultiAssetPlan } from "./multi-asset-plan.mjs";
+import { renderMultiAssetProject } from "./multi-asset-render.mjs";
+import { sanitizePublicResponse } from "./public-error.mjs";
+import { recoverInterruptedMultiAssetProject } from "./multi-asset-recovery.mjs";
 
 try {
   if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
@@ -37,10 +44,14 @@ const store = createProjectStore(resolve(process.env.WAYNE_STORAGE_DIR || join(r
 const subscribers = new Map();
 const brollSearchRequests = new Map();
 const activeTranscriptions = new Set();
+const activeAssetAnalyses = new Set();
+const assetUploadLocks = new Map();
 const editorRuntime = editorState();
 const engineAvailability = getEngineAvailability({ remotion: await remotionRuntimeAvailable() });
 let openchatcutAvailability = { ...engineAvailability.openchatcut };
 await store.loadProjects();
+
+for (const project of store.projects.values()) if (recoverInterruptedMultiAssetProject(project)) await store.saveProject(project);
 
 function availableEngines() {
   return { ...engineAvailability, openchatcut: openchatcutAvailability };
@@ -48,7 +59,7 @@ function availableEngines() {
 
 function json(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(sanitizePublicResponse(body)));
 }
 
 function isLoopbackClient(req) {
@@ -97,18 +108,23 @@ function configState() {
 }
 
 function projectView(project) {
-  const media = project.media ? { ...project.media, path: undefined } : project.media;
+  const media = project.media ? { ...project.media, path: undefined } : project.assets?.length ? { filename: `${project.assets.length} 段素材`, durationMs: project.assets.reduce((total, asset) => total + (Number(asset.durationMs) || 0), 0), width: 0, height: 0 } : null;
   const music = project.music ? { ...project.music, path: undefined } : project.music;
   const brollAssets = (project.brollAssets || []).map((asset) => ({ ...asset, path: undefined }));
-  return {
+  const assets = (project.assets || []).map((asset) => ({ ...asset, path: undefined, visualEvidence: asset.visualEvidence ? { ...asset.visualEvidence, path: undefined } : undefined }));
+  return sanitizePublicResponse({
     ...project,
+    workflowMode: normalizeWorkflowMode(project.workflowMode),
+    multiAssetPlan: project.multiAssetPlan ? { ...project.multiAssetPlan } : null,
+    multiAssetPreview: project.multiAssetPreview ? { ...project.multiAssetPreview } : null,
     dir: undefined,
     media,
     music,
     brollAssets,
+    assets,
     config: configState(),
-    artifacts: (project.artifacts || []).map((artifact) => ({ ...artifact, url: `/api/projects/${project.id}/artifacts/${encodeURIComponent(artifact.name)}` })),
-  };
+    artifacts: (project.artifacts || []).map((artifact) => ({ ...artifact, url: `/api/projects/${project.id}/artifacts/${encodeURIComponent(artifact.name)}`, streamUrl: `/media/${project.id}/artifacts/${encodeURIComponent(artifact.name)}` })),
+  });
 }
 
 function projectSummary(project) {
@@ -121,10 +137,10 @@ function projectSummary(project) {
     createdAt: project.createdAt,
     updatedAt: project.updatedAt,
     error: project.error,
-    media: project.media ? { filename: project.media.filename, durationMs: project.media.durationMs, width: project.media.width, height: project.media.height } : null,
+    media: project.media ? { filename: project.media.filename, durationMs: project.media.durationMs, width: project.media.width, height: project.media.height } : project.assets?.length ? { filename: `${project.assets.length} 段素材`, durationMs: project.assets.reduce((total, asset) => total + (Number(asset.durationMs) || 0), 0) } : null,
     latestVersion,
-    hasTranscript: Boolean(project.transcript),
-    hasPlan: Boolean(project.plan),
+    hasTranscript: Boolean(project.transcript || project.assets?.some((asset) => asset.transcript)),
+    hasPlan: Boolean(project.plan || project.multiAssetPlan),
     hasPreview: Boolean((project.artifacts || []).some((artifact) => artifact.kind === "preview")),
     hasFinal: Boolean((project.artifacts || []).some((artifact) => artifact.kind === "video")),
   };
@@ -147,6 +163,19 @@ function allowBrollSearch(req) {
     while (brollSearchRequests.size > 5000) brollSearchRequests.delete(brollSearchRequests.keys().next().value);
   }
   return true;
+}
+
+async function withAssetUploadLock(key, operation) {
+  const previous = assetUploadLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  assetUploadLocks.set(key, current);
+  await previous;
+  try { return await operation(); }
+  finally {
+    if (assetUploadLocks.get(key) === current) assetUploadLocks.delete(key);
+    release();
+  }
 }
 
 async function writeUploadChunk(req, project) {
@@ -199,6 +228,71 @@ async function completeChunkedUpload(project) {
   return project;
 }
 
+async function writeAssetUploadChunk(req, project, asset) {
+  const offset = headerNumber(req, "x-upload-offset");
+  const totalBytes = headerNumber(req, "x-upload-total");
+  const length = headerNumber(req, "x-upload-length");
+  const bodyLength = Number.isSafeInteger(length) ? length : headerNumber(req, "content-length");
+  const maxChunkBytes = 8 * 1024 * 1024;
+  if (!asset?.upload || asset.status !== "uploading") throw Object.assign(new Error("素材当前没有待续传的上传"), { statusCode: 409 });
+  if (!Number.isSafeInteger(offset) || offset < 0 || totalBytes !== asset.upload.totalBytes || !Number.isSafeInteger(bodyLength) || bodyLength <= 0 || bodyLength > maxChunkBytes) throw Object.assign(new Error("素材分块上传参数无效"), { statusCode: 400 });
+  if (offset + bodyLength > totalBytes) throw Object.assign(new Error("素材分块超出文件大小"), { statusCode: 400 });
+  const receivedBytes = Number(asset.upload.receivedBytes || 0);
+  if (offset < receivedBytes && offset + bodyLength <= receivedBytes) {
+    const chunks = [];
+    let replayLength = 0;
+    for await (const chunk of req) { chunks.push(chunk); replayLength += chunk.length; }
+    if (replayLength !== bodyLength) throw Object.assign(new Error("重试分块大小与原上传不一致"), { statusCode: 409, receivedBytes });
+    const replay = Buffer.concat(chunks, replayLength);
+    const handle = await fs.open(join(assetDir(project, asset.id), "source.part"), "r");
+    let stored;
+    try { stored = Buffer.alloc(replayLength); await handle.read(stored, 0, replayLength, offset); }
+    finally { await handle.close(); }
+    if (!stored.equals(replay)) throw Object.assign(new Error("重试分块内容与已确认素材不一致，请重新开始上传"), { statusCode: 409, receivedBytes });
+    return { receivedBytes, totalBytes };
+  }
+  if (offset !== receivedBytes) throw Object.assign(new Error(`素材上传位置不匹配，应从 ${receivedBytes} 字节继续`), { statusCode: 409, receivedBytes });
+  const directory = assetDir(project, asset.id);
+  const partPath = join(directory, "source.part");
+  const output = createWriteStream(partPath, { flags: offset === 0 ? "w" : "r+", start: offset });
+  let received = 0;
+  const chunkHash = createHash("sha256");
+  const counter = new Transform({ transform(chunk, _encoding, callback) { received += chunk.length; chunkHash.update(chunk); callback(null, chunk); } });
+  try { await pipeline(req, counter, output); } catch (error) { if (req.aborted || req.destroyed) throw Object.assign(error, { requestAborted: true }); throw error; }
+  await fs.truncate(partPath, offset + received);
+  if (received !== bodyLength) throw Object.assign(new Error(`素材分块大小不匹配，收到 ${received} 字节，期望 ${bodyLength} 字节`), { statusCode: 400 });
+  asset.upload.receivedBytes = offset + received;
+  asset.upload.chunkHashes = [...(asset.upload.chunkHashes || []).filter((item) => item.offset !== offset), { offset, length: received, sha256: chunkHash.digest("hex") }];
+  await save(project);
+  return { receivedBytes: asset.upload.receivedBytes, totalBytes };
+}
+
+async function completeAssetUpload(project, asset) {
+  if (!asset?.upload || asset.status !== "uploading") throw Object.assign(new Error("素材没有待完成的上传"), { statusCode: 409 });
+  if (asset.upload.receivedBytes !== asset.upload.totalBytes) throw Object.assign(new Error(`素材上传尚未完成，还缺少 ${asset.upload.totalBytes - asset.upload.receivedBytes} 字节`), { statusCode: 409, receivedBytes: asset.upload.receivedBytes });
+  const directory = assetDir(project, asset.id);
+  const partPath = join(directory, "source.part");
+  const sourcePath = join(directory, `source${extname(asset.filename).toLowerCase()}`);
+  const sourceStat = await fs.stat(sourcePath).catch(() => null);
+  const uploadPath = sourceStat ? sourcePath : partPath;
+  const stat = sourceStat || await fs.stat(partPath);
+  if (stat.size !== asset.upload.totalBytes) throw Object.assign(new Error("素材文件大小与已确认上传字节不一致，请重新续传"), { statusCode: 409 });
+  const metadata = await probeMedia(uploadPath);
+  const record = createAssetRecord({ id: asset.id, filename: asset.filename, path: sourcePath, bytes: asset.upload.totalBytes, metadata, role: asset.role, label: asset.label, licenseConfirmed: asset.licenseConfirmed });
+  record.sha256 = await sha256File(uploadPath);
+  record.chunkHashes = (asset.upload.chunkHashes || []).map((item) => ({ ...item }));
+  record.analysisStatus = "pending";
+  if (uploadPath !== sourcePath) await fs.rename(partPath, sourcePath);
+  project.assets = project.assets.map((item) => item.id === asset.id ? record : item);
+  archiveMultiAssetPlan(project);
+  project.assetAnalysis = { status: "pending", completed: project.assets.filter((item) => item.analysisStatus === "ready").length, failed: 0 };
+  project.status = "assets_ready";
+  project.error = null;
+  await save(project);
+  publish(project.id, { type: "asset_uploaded", assetId: asset.id, status: project.status, message: `素材“${record.label}”已上传，等待分析` });
+  return project;
+}
+
 async function save(project) {
   project.updatedAt = new Date().toISOString();
   return store.saveProject(project);
@@ -220,7 +314,20 @@ await recoverInterruptedChatEdits();
 function publish(projectId, event) {
   const project = store.get(projectId);
   const payload = project ? { ...event, project: projectView(project) } : event;
-  for (const response of subscribers.get(projectId) || []) response.write(`data: ${JSON.stringify(payload)}\n\n`);
+  for (const response of subscribers.get(projectId) || []) response.write(`data: ${JSON.stringify(sanitizePublicResponse(payload))}\n\n`);
+}
+
+function archiveMultiAssetPlan(project) {
+  project.multiAssetRevision = Number(project.multiAssetRevision || 0) + 1;
+  project.multiAssetInputRevision = Number(project.multiAssetInputRevision || 0) + 1;
+  if (project.multiAssetPlan) {
+    const history = project.multiAssetPlanHistory || [];
+    if (!history.some((item) => Number(item.version) === Number(project.multiAssetPlan.version))) project.multiAssetPlanHistory = [...history, project.multiAssetPlan];
+  }
+  project.multiAssetPlan = null;
+  project.multiAssetPreview = null;
+  project.multiAssetPreviewReview = null;
+  project.qc = null;
 }
 
 async function readJson(req) {
@@ -309,7 +416,9 @@ async function serveFile(req, res, path, contentType, disposition = "inline") {
 
 async function createProject(body = {}) {
   const id = randomUUID();
-  const project = { id, workflowId: "wayne-video-editing", compositionMode: REMOTION_MAIN_MODE, status: "created", goal: body.goal || "", style: body.style || "Wayne / clean creator", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, transcription: null, proofreading: null, plan: null, qc: null, error: null, upload: null, editSession: null };
+  const workflowMode = normalizeWorkflowMode(body.workflowMode);
+  const brief = workflowMode === "multi-asset-v1" ? normalizeBrief(body.brief || { rawText: body.goal || "" }) : null;
+  const project = { id, workflowId: "wayne-video-editing", workflowMode, compositionMode: REMOTION_MAIN_MODE, status: "created", goal: body.goal || brief?.rawText || "", style: body.style || "Wayne / clean creator", brief, assets: [], assetAnalysis: { status: "pending", completed: 0, failed: 0 }, outputProfiles: brief ? (brief.aspectRatio === "both" ? ["landscape", "portrait"] : [brief.aspectRatio]) : [], multiAssetPlan: null, multiAssetPlanHistory: [], multiAssetPreview: null, multiAssetRevision: 0, multiAssetInputRevision: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), dir: store.projectDir(id), artifacts: [], comments: [], brollAssets: [], media: null, transcript: null, transcription: null, proofreading: null, plan: null, qc: null, error: null, upload: null, editSession: null };
   await save(project);
   return project;
 }
@@ -454,6 +563,22 @@ async function handle(req, res) {
   }
   if (req.method === "POST" && url.pathname === "/api/projects") { try { return json(res, 201, projectView(await createProject(await readJson(req)))); } catch (error) { return json(res, 400, { error: error.message }); } }
 
+  if (req.method === "GET" && segments[0] === "media" && segments[1] && segments[2] === "assets" && segments[3] && segments[4] === "transcript-audio.wav") {
+    const project = store.get(segments[1]);
+    const asset = (project?.assets || []).find((item) => item.id === segments[3]);
+    const target = asset && join(assetDir(project, asset.id), "transcript-audio.wav");
+    try { return serveFile(req, res, target, "audio/wav"); } catch { return json(res, 404, { error: "asset transcript audio not found" }); }
+  }
+  if (req.method === "GET" && segments[0] === "media" && segments[1] && segments[2] === "artifacts" && segments[3]) {
+    const project = store.get(segments[1]);
+    let name;
+    try { name = decodeURIComponent(segments.slice(3).join("/")); } catch { return json(res, 400, { error: "invalid artifact path" }); }
+    const artifact = (project?.artifacts || []).find((item) => item.name === name);
+    const target = artifact && store.artifactPath(project, name);
+    if (!target) return json(res, 404, { error: "artifact not found" });
+    const contentType = name.endsWith(".mp4") ? "video/mp4" : name.endsWith(".webm") ? "video/webm" : name.endsWith(".wav") ? "audio/wav" : "application/octet-stream";
+    try { return serveFile(req, res, target, contentType, "inline"); } catch { return json(res, 404, { error: "artifact not found" }); }
+  }
   if (req.method === "GET" && segments[0] === "media" && segments[1] && ["input.mp4", "transcript-audio.wav"].includes(segments[2])) {
     const project = store.get(segments[1]); const target = project && join(project.dir, segments[2]);
     try { return serveFile(req, res, target, segments[2].endsWith("wav") ? "audio/wav" : "video/mp4"); } catch { return json(res, 404, { error: "media not found" }); }
@@ -462,6 +587,135 @@ async function handle(req, res) {
   const project = segments[0] === "api" && segments[1] === "projects" ? store.get(segments[2]) : null;
   if (!project) return json(res, 404, { error: "project not found" });
   ensureTranscriptReviewState(project);
+  if (req.method === "POST" && segments[3] === "assets" && segments.length === 4) {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "素材库上传仅适用于多素材项目" });
+    if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，请等待完成后再管理素材" });
+    try {
+      const asset = await withAssetUploadLock(`${project.id}:assets`, async () => {
+        if (activeAssetAnalyses.has(project.id) || ["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，不能添加新素材"), { statusCode: 409 });
+        const body = await readJson(req);
+        const filename = String(body.filename || "").replaceAll("\\", "/").split("/").at(-1) || "";
+        const totalBytes = Number(body.totalBytes);
+        const currentTotalBytes = (project.assets || []).reduce((total, item) => total + Number(item.bytes || item.upload?.totalBytes || 0), 0);
+        const { extension } = validateAssetUpload({ filename, byteLength: totalBytes, currentAssetCount: project.assets?.length || 0, currentTotalBytes });
+        const role = String(body.role || "supporting");
+        if (!["main", "supporting", "broll", "voiceover"].includes(role)) throw new Error("素材角色无效");
+        const id = randomUUID();
+        const dir = assetDir(project, id);
+        await fs.mkdir(dir, { recursive: true });
+        const record = { id, filename, path: join(dir, `source${extension}`), bytes: 0, expectedBytes: totalBytes, durationMs: 0, width: 0, height: 0, hasVideo: true, hasAudio: false, role, label: String(body.label || filename).slice(0, 120), licenseConfirmed: body.licenseConfirmed === true, status: "uploading", analysisStatus: "pending", upload: { totalBytes, receivedBytes: 0, chunkHashes: [] }, createdAt: new Date().toISOString() };
+        archiveMultiAssetPlan(project);
+        project.assetAnalysis = { ...(project.assetAnalysis || {}), status: "pending" };
+        project.assets = [...(project.assets || []), record];
+        project.status = "uploading_assets";
+        project.error = null;
+        await save(project);
+        publish(project.id, { type: "asset_upload_started", assetId: id, status: project.status, message: `开始上传素材“${record.label}”` });
+        return record;
+      });
+      return json(res, 201, projectView(project));
+    } catch (error) {
+      return json(res, error.statusCode || 400, { error: error.message });
+    }
+  }
+  if (req.method === "GET" && segments[3] === "assets" && segments.length === 4) return json(res, 200, { assets: projectView(project).assets || [] });
+  if (req.method === "POST" && segments[3] === "assets" && segments[5] === "chunk") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "素材分块上传仅适用于多素材项目" });
+    const asset = (project.assets || []).find((item) => item.id === segments[4]);
+    if (!asset) return json(res, 404, { error: "素材不存在" });
+    try { return json(res, 200, { ...await withAssetUploadLock(`${project.id}:assets`, () => {
+      if (activeAssetAnalyses.has(project.id) || ["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，不能同时修改上传内容"), { statusCode: 409 });
+      return writeAssetUploadChunk(req, project, asset);
+    }), status: project.status, assetId: asset.id }); }
+    catch (error) { if (error.requestAborted || req.aborted) return; return json(res, error.statusCode || 400, { error: error.message, receivedBytes: error.receivedBytes ?? asset.upload?.receivedBytes ?? 0 }); }
+  }
+  if (req.method === "POST" && segments[3] === "assets" && segments[5] === "complete") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "素材上传仅适用于多素材项目" });
+    const asset = (project.assets || []).find((item) => item.id === segments[4]);
+    if (!asset) return json(res, 404, { error: "素材不存在" });
+    try { return json(res, 201, projectView(await withAssetUploadLock(`${project.id}:assets`, () => {
+      if (activeAssetAnalyses.has(project.id) || ["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，不能同时完成上传"), { statusCode: 409 });
+      return completeAssetUpload(project, asset);
+    }))); }
+    catch (error) { return json(res, error.statusCode || 400, { error: error.message, receivedBytes: error.receivedBytes ?? asset.upload?.receivedBytes ?? 0 }); }
+  }
+  if (req.method === "PUT" && segments[3] === "assets" && segments[4] && segments.length === 5) {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "素材管理仅适用于多素材项目" });
+    if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，请等待本轮完成后再管理素材" });
+    const asset = (project.assets || []).find((item) => item.id === segments[4]);
+    if (!asset || asset.status === "uploading") return json(res, 404, { error: "已上传素材不存在" });
+    try {
+      const body = await readJson(req);
+      if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，请稍后修改素材"), { statusCode: 409 });
+      if (body.role != null) {
+        if (!["main", "supporting", "broll", "voiceover"].includes(String(body.role))) throw new Error("素材角色无效");
+        asset.role = String(body.role);
+      }
+      if (body.label != null) asset.label = String(body.label).trim().slice(0, 120) || asset.filename;
+      if (body.licenseConfirmed != null) asset.licenseConfirmed = body.licenseConfirmed === true;
+      if (body.retryAnalysis === true) { asset.analysisStatus = "pending"; asset.analysisError = null; project.assetAnalysis = { ...(project.assetAnalysis || {}), status: "pending" }; }
+      archiveMultiAssetPlan(project);
+      if (project.assetAnalysis?.status === "ready" && project.assets.every((item) => ["ready", "complete"].includes(item.analysisStatus))) {
+        project.assetInventory = buildAssetInventory(project);
+        await fs.writeFile(join(project.dir, "asset-inventory.json"), JSON.stringify(project.assetInventory, null, 2));
+      }
+      project.status = "assets_ready";
+      await save(project);
+      publish(project.id, { type: "asset_updated", assetId: asset.id, status: project.status });
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+  if (req.method === "DELETE" && segments[3] === "assets" && segments[4] && segments.length === 5) {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "素材管理仅适用于多素材项目" });
+    try {
+      await withAssetUploadLock(`${project.id}:assets`, async () => {
+        if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，不能删除素材"), { statusCode: 409 });
+        const asset = (project.assets || []).find((item) => item.id === segments[4]);
+        if (!asset) throw Object.assign(new Error("素材不存在"), { statusCode: 404 });
+        if (!["uploading", "failed"].includes(asset.status) && asset.analysisStatus !== "failed") throw Object.assign(new Error("只能移除未完成或失败的素材；已完成素材请先创建新项目"), { statusCode: 409 });
+        await fs.rm(assetDir(project, asset.id), { recursive: true, force: true });
+        project.assets = project.assets.filter((item) => item.id !== asset.id);
+        project.assetAnalysis = { status: "pending", completed: project.assets.filter((item) => item.analysisStatus === "ready").length, failed: project.assets.filter((item) => item.analysisStatus === "failed").length };
+        archiveMultiAssetPlan(project);
+        project.status = project.assets.length ? "assets_ready" : "created";
+        project.error = null;
+        await save(project);
+        publish(project.id, { type: "asset_removed", assetId: asset.id, status: project.status, message: `已移除未完成素材“${asset.label || asset.filename}”` });
+      });
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, error.statusCode || 400, { error: error.message }); }
+  }
+  if (req.method === "PUT" && segments[3] === "brief") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "方案编辑仅适用于多素材项目" });
+    if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，请稍后修改方案" });
+    try {
+      const body = await readJson(req);
+      if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，请稍后修改方案"), { statusCode: 409 });
+      project.brief = normalizeBrief(body);
+      project.goal = project.brief.rawText;
+      project.outputProfiles = project.brief.aspectRatio === "both" ? ["landscape", "portrait"] : [project.brief.aspectRatio];
+      archiveMultiAssetPlan(project);
+      if (project.assetAnalysis?.status === "ready") {
+        project.assetInventory = buildAssetInventory(project);
+        await fs.writeFile(join(project.dir, "asset-inventory.json"), JSON.stringify(project.assetInventory, null, 2));
+      }
+      project.status = "assets_ready";
+      project.error = null;
+      await save(project);
+      publish(project.id, { type: "brief_updated", status: project.status });
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
+  if (req.method === "GET" && segments[3] === "assets" && ["media", "contact-sheet"].includes(segments[5])) {
+    const asset = (project.assets || []).find((item) => item.id === segments[4]);
+    const target = segments[5] === "contact-sheet" ? asset?.visualEvidence?.path : asset?.path;
+    if (!target || asset.status !== "ready") return json(res, 404, { error: "素材文件不存在" });
+    if (segments[5] === "contact-sheet") {
+      try { return serveFile(req, res, target, "image/jpeg"); } catch { return json(res, 404, { error: "素材关键帧不存在" }); }
+    }
+    const contentType = ({ ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/mp4", ".webm": "video/webm" })[extname(asset.filename).toLowerCase()] || "application/octet-stream";
+    try { return serveFile(req, res, asset.path, contentType); } catch { return json(res, 404, { error: "素材文件不存在" }); }
+  }
   if (req.method === "GET" && segments.length === 3) return json(res, 200, projectView(project));
   if (req.method === "GET" && segments[3] === "transcript-audio") {
     try { return serveFile(req, res, join(project.dir, "transcript-audio.wav"), "audio/wav"); }
@@ -498,11 +752,162 @@ async function handle(req, res) {
     } catch (error) { return json(res, 400, { error: error.message, status: project.status }); }
   }
   if (req.method === "GET" && segments[3] === "timeline") {
+    if (project.workflowMode === "multi-asset-v1") {
+      try { return json(res, 200, toTimelineV2(project)); }
+      catch (error) { return json(res, 409, { error: error.message, status: project.status }); }
+    }
     if (!project.media || !project.plan) return json(res, 409, { error: "生成标准时间线需要已上传媒体和剪辑计划", status: project.status });
     try { return json(res, 200, toTimelineV1(project)); }
     catch (error) { return json(res, 422, { error: error.message, status: project.status }); }
   }
+  if (req.method === "POST" && segments[3] === "analyze") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "素材分析仅适用于多素材项目" });
+    try {
+      await withAssetUploadLock(`${project.id}:assets`, async () => {
+        if (activeAssetAnalyses.has(project.id) || project.status === "analyzing_assets") throw Object.assign(new Error("当前已有素材分析任务正在运行"), { statusCode: 409 });
+        if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在制作，请等待当前任务完成"), { statusCode: 409 });
+        if ((project.assets || []).some((asset) => asset.status !== "ready")) throw Object.assign(new Error("所有素材上传完成后才能开始分析"), { statusCode: 409 });
+        if (project.assets.some((asset) => asset.hasAudio) && !configState().transcription) throw Object.assign(new Error("含音轨素材需要配置火山引擎或腾讯云转录凭证"), { statusCode: 409 });
+        activeAssetAnalyses.add(project.id);
+        archiveMultiAssetPlan(project);
+        project.status = "analyzing_assets";
+        project.error = null;
+        await save(project);
+        publish(project.id, { type: "stage", status: project.status, message: "正在逐条分析视频素材" });
+      });
+    } catch (error) { return json(res, error.statusCode || 409, { error: error.message }); }
+    try {
+      await analyzeMultiAssetProject(project, {
+        transcribe: transcribeVideo,
+        persist: save,
+        publicMediaBaseUrl: process.env.VOLCENGINE_ASR_PUBLIC_BASE_URL || "",
+        onAsset: async ({ asset, status, pass, error }) => {
+          project.assetAnalysis = { ...(project.assetAnalysis || {}), currentAssetId: asset.id, currentStatus: status };
+          await save(project);
+          publish(project.id, { type: "asset_analysis", assetId: asset.id, pass, status, error, message: `${asset.label}：${pass === "primary" ? "云端转录" : pass === "secondary" ? "本地校对" : status}` });
+        },
+      });
+      project.assetInventory = buildAssetInventory(project);
+      await fs.writeFile(join(project.dir, "asset-inventory.json"), JSON.stringify(project.assetInventory, null, 2));
+      project.status = "transcript_ready";
+      await save(project);
+      publish(project.id, { type: "stage", status: project.status, message: "所有素材分析完成，可以生成剪辑方案" });
+      return json(res, 200, projectView(project));
+    } catch (error) {
+      project.assetAnalysis = { ...(project.assetAnalysis || {}), status: "failed", error: error.message };
+      project.status = "needs_input";
+      project.error = error.message;
+      await save(project).catch(() => undefined);
+      publish(project.id, { type: "failed", status: project.status, message: error.message });
+      return json(res, 502, { error: error.message, status: project.status, project: projectView(project) });
+    } finally {
+      activeAssetAnalyses.delete(project.id);
+    }
+  }
+  if (req.method === "POST" && segments[3] === "plan" && segments.length === 4) {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "多素材方案仅适用于多素材项目" });
+    if (activeAssetAnalyses.has(project.id) || project.status === "analyzing_assets") return json(res, 409, { error: "素材分析尚未完成，不能生成方案" });
+    if (project.assetAnalysis?.status !== "ready") return json(res, 409, { error: "请先完成所有素材的分析" });
+    if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在制作，请等待当前任务完成" });
+    if (!configState().anthropic) return json(res, 409, { error: "未配置 ANTHROPIC_API_KEY，无法生成剪辑方案" });
+    project.status = "planning";
+    project.error = null;
+    await save(project);
+    publish(project.id, { type: "stage", status: project.status, message: "Claude 正在依据方案、逐素材转录和真实素材信息编排故事线" });
+    try {
+      const body = await readJson(req);
+      project.assetInventory = buildAssetInventory(project);
+      const previousPlan = project.multiAssetPlan;
+      const nextPlan = await planMultiAssetWithClaude({ project, editRequest: body.request });
+      const planFiles = await fs.readdir(project.dir);
+      const storedVersions = planFiles.map((name) => Number(name.match(/^multi-plan-v(\d+)\.json$/)?.[1] || 0));
+      nextPlan.version = Math.max(nextPlan.version, 1 + Math.max(0, ...storedVersions));
+      const planPath = join(project.dir, `multi-plan-v${nextPlan.version}.json`);
+      await fs.writeFile(planPath, JSON.stringify(nextPlan, null, 2), { flag: "wx" });
+      if (previousPlan && !project.multiAssetPlanHistory?.some((item) => Number(item.version) === Number(previousPlan.version))) project.multiAssetPlanHistory = [...(project.multiAssetPlanHistory || []), previousPlan];
+      project.multiAssetPlan = nextPlan;
+      project.multiAssetPreview = null;
+      project.plan = null;
+      project.qc = null;
+      project.status = "plan_ready";
+      await save(project);
+      publish(project.id, { type: "stage", status: project.status, message: "方案已生成，请检查故事顺序和素材来源后确认" });
+      return json(res, 200, projectView(project));
+    } catch (error) {
+      project.status = "needs_input";
+      project.error = error.message;
+      await save(project);
+      publish(project.id, { type: "needs_input", status: project.status, message: error.message });
+      return json(res, 502, { error: error.message, status: project.status, project: projectView(project) });
+    }
+  }
+  if (req.method === "POST" && segments[3] === "plan" && segments[4] === "confirm") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "多素材方案仅适用于多素材项目" });
+    if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在制作，请等待本轮完成后确认方案" });
+    try {
+      const body = await readJson(req);
+      const confirmed = confirmMultiAssetPlan(project, body);
+      Object.assign(project, confirmed);
+      project.qc = null;
+      await save(project);
+      publish(project.id, { type: "plan_confirmed", status: project.status, message: "方案已确认，可以生成横屏和竖屏成片" });
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, error.statusCode || 400, { error: error.message }); }
+  }
+  if (req.method === "POST" && segments[3] === "plan" && segments[4] === "restore") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "多素材方案仅适用于多素材项目" });
+    if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，请等待本轮完成后恢复方案" });
+    try {
+      const body = await readJson(req);
+      const restored = restoreMultiAssetPlan(project, body);
+      Object.assign(project, restored);
+      await save(project);
+      publish(project.id, { type: "plan_restored", status: project.status, message: `已恢复历史方案 v${body.version}，请重新检查并确认` });
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, error.statusCode || 400, { error: error.message }); }
+  }
+  if (req.method === "POST" && segments[3] === "preview" && segments.length === 4) {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "多素材预览仅适用于多素材项目" });
+    if (!project.multiAssetPlan?.confirmed) return json(res, 409, { error: "请先检查并确认剪辑方案" });
+    if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在制作，请等待当前任务完成" });
+    project.status = "rendering_preview";
+    project.error = null;
+    await save(project);
+    publish(project.id, { type: "stage", status: project.status, message: "正在生成横屏和竖屏低分辨率预览" });
+    try {
+      const result = await renderMultiAssetProject(project, { preview: true });
+      project.artifacts = [...(project.artifacts || []), ...result.artifacts];
+      project.multiAssetPreview = { planVersion: project.multiAssetPlan.version, inputRevision: Number(project.multiAssetRevision || 0), qc: result.qc, profiles: result.profiles, generatedAt: new Date().toISOString() };
+      project.multiAssetPreviewReview = null;
+      project.status = "preview_ready";
+      await save(project);
+      publish(project.id, { type: "stage", status: project.status, message: "横竖屏预览已生成，请播放检查后再导出" });
+      return json(res, 200, projectView(project));
+    } catch (error) {
+      project.status = "failed";
+      project.error = error.message;
+      await save(project);
+      publish(project.id, { type: "failed", status: project.status, message: error.message });
+      return json(res, 502, { error: error.message, status: project.status, project: projectView(project) });
+    }
+  }
+  if (req.method === "POST" && segments[3] === "preview" && segments[4] === "reviewed") {
+    if (project.workflowMode !== "multi-asset-v1") return json(res, 409, { error: "多素材预览审阅仅适用于多素材项目" });
+    if (!project.multiAssetPreview?.qc?.passed || Number(project.multiAssetPreview.planVersion) !== Number(project.multiAssetPlan?.version) || Number(project.multiAssetPreview.inputRevision) !== Number(project.multiAssetRevision || 0)) return json(res, 409, { error: "当前方案和素材配置还没有通过 QC 的预览" });
+    try {
+      const body = await readJson(req);
+      if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，暂时不能修改预览检查状态" });
+      if (Number(body.planVersion) !== Number(project.multiAssetPlan.version) || Number(project.multiAssetPreview.inputRevision) !== Number(project.multiAssetRevision || 0)) return json(res, 409, { error: "方案或素材配置已更新，请检查最新预览" });
+      const valid = new Set(project.multiAssetPreview.profiles.map((profile) => profile.id));
+      const profiles = [...new Set((Array.isArray(body.profiles) ? body.profiles : []).map(String))];
+      if (profiles.some((profile) => !valid.has(profile))) return json(res, 400, { error: "预览画幅无效" });
+      project.multiAssetPreviewReview = { planVersion: project.multiAssetPlan.version, inputRevision: Number(project.multiAssetRevision || 0), profiles, reviewedAt: new Date().toISOString() };
+      await save(project);
+      return json(res, 200, projectView(project));
+    } catch (error) { return json(res, 400, { error: error.message }); }
+  }
   if (req.method === "POST" && segments[3] === "broll" && segments[4] === "search") {
+    if (project.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材项目请先把 B-roll 上传到素材库，并将角色设为 B-roll" });
     try {
       const providers = brollProviderState();
       if (!providers.pexels && !providers.pixabay) return json(res, 503, { error: "尚未配置 PEXELS_API_KEY 或 PIXABAY_API_KEY", providers });
@@ -524,16 +929,24 @@ async function handle(req, res) {
     const filename = decodeURIComponent(String(req.headers["x-music-filename"] || "music.mp3"));
     const extension = extname(filename).toLowerCase();
     if (![".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"].includes(extension)) return json(res, 415, { error: "支持 MP3、WAV、M4A、AAC、OGG 或 FLAC 音频" });
-    if (project.status === "rendering") return json(res, 409, { error: "项目正在渲染，请稍后再上传音乐" });
+    if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，请稍后再上传音乐" });
     const target = join(project.dir, `music-${randomUUID()}${extension}`);
     try {
       const upload = await parseMultipart(req, match[1].replace(/^"|"$/g, ""), target, limit);
       if (!upload.licenseConfirmed) throw new Error("请先确认你拥有该音乐的使用许可");
       const metadata = await probeMedia(target);
       if (!metadata.hasAudio || metadata.hasVideo) throw new Error("请上传纯音频文件作为配乐");
-      project.music = { filename: upload.filename, path: target, licenseConfirmed: true };
+      if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，请稍后修改配乐"), { statusCode: 409 });
+      const musicSha256 = await sha256File(target);
+      if (["analyzing_assets", "planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) throw Object.assign(new Error("项目正在处理，请稍后修改配乐"), { statusCode: 409 });
+      project.music = { filename: upload.filename, path: target, licenseConfirmed: true, sha256: musicSha256 };
       project.qc = null;
-      project.status = project.plan ? "plan_ready" : project.status;
+      if (project.workflowMode === "multi-asset-v1") {
+        project.multiAssetRevision = Number(project.multiAssetRevision || 0) + 1;
+        project.multiAssetPreview = null;
+        project.multiAssetPreviewReview = null;
+        if (project.multiAssetPlan?.confirmed) project.status = "plan_confirmed";
+      } else project.status = project.plan ? "plan_ready" : project.status;
       project.error = null;
       await save(project);
       publish(project.id, { type: "music", status: project.status, message: "已添加授权配乐" });
@@ -544,6 +957,7 @@ async function handle(req, res) {
     }
   }
   if (req.method === "POST" && segments[3] === "broll") {
+    if (project.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材项目请把 B-roll 作为视频素材上传到素材库" });
     const limit = 100 * 1024 * 1024;
     if (Number(req.headers["content-length"] || 0) > limit) return json(res, 413, { error: "B-roll 视频不能超过 100MB" });
     const match = String(req.headers["content-type"] || "").match(/boundary=([^;]+)/i);
@@ -551,7 +965,7 @@ async function handle(req, res) {
     const filename = decodeURIComponent(String(req.headers["x-broll-filename"] || "broll.mp4"));
     const extension = extname(filename).toLowerCase();
     if (![".mp4", ".mov", ".m4v", ".webm"].includes(extension)) return json(res, 415, { error: "B-roll 支持 MP4、MOV、M4V 或 WebM 视频" });
-    if (project.status === "rendering") return json(res, 409, { error: "项目正在渲染，请稍后再上传 B-roll" });
+    if (["rendering", "rendering_preview"].includes(project.status)) return json(res, 409, { error: "项目正在渲染，请稍后再上传 B-roll" });
     const target = join(project.dir, `broll-${randomUUID()}${extension}`);
     try {
       const upload = await parseMultipart(req, match[1].replace(/^"|"$/g, ""), target, limit);
@@ -671,6 +1085,7 @@ async function handle(req, res) {
     }
   }
   if (req.method === "POST" && segments[3] === "input") {
+    if (project.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材项目请通过素材库上传视频" });
     if (segments[4] === "chunk") {
       try {
         const result = await writeUploadChunk(req, project);
@@ -690,6 +1105,7 @@ async function handle(req, res) {
     try { const path = join(project.dir, "input.mp4"); const upload = await parseMultipart(req, match[1].replace(/^"|"$/g, ""), path); const metadata = await probeMedia(path); project.media = { filename: upload.filename, path, ...metadata }; project.goal = upload.goal || project.goal; project.style = upload.style || project.style; project.status = "inspecting"; project.error = null; await save(project); publish(project.id, { type: "stage", status: project.status, message: "已读取真实媒体信息" }); return json(res, 201, projectView(project)); } catch (error) { if (error.message === "aborted" || req.aborted || req.destroyed) { project.error = "上传连接中断，请重试"; await save(project); return; } project.status = "failed"; project.error = error.message; await save(project); return json(res, 400, { error: error.message, status: project.status }); }
   }
   if (req.method === "POST" && segments[3] === "advance") {
+    if (project.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材项目请使用素材分析、方案和预览专用流程" });
     try {
       if (["planning", "rendering"].includes(project.status)) throw Object.assign(new Error("Claude Code 正在处理中，请等待本轮完成"), { statusCode: 409 });
       if (project.status === "inspecting" || project.status === "transcribing" || (project.status === "needs_input" && !project.transcript) || (project.status === "failed" && project.media && !project.transcript)) await transitionToTranscript(project);
@@ -702,6 +1118,8 @@ async function handle(req, res) {
     } catch (error) { return json(res, error.statusCode || 502, { error: error.message, status: project.status, config: configState() }); }
   }
   if (req.method === "POST" && segments[3] === "comments") {
+    if (project.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材项目请在方案审核区直接修改故事顺序或镜头来源" });
+    if (["transcribing", "planning", "rendering", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理中，暂时不能添加批注" });
     try { const body = await readJson(req); const text = String(body.text || "").trim(); if (!text) throw new Error("批注内容不能为空"); project.comments = [...(project.comments || []), { id: randomUUID(), timeMs: Math.max(0, Number(body.timeMs) || 0), text, createdAt: new Date().toISOString() }]; project.status = "awaiting_revision"; await save(project); publish(project.id, { type: "comment", comment: project.comments.at(-1), status: project.status }); return json(res, 201, projectView(project)); } catch (error) { return json(res, 400, { error: error.message }); }
   }
   if (req.method === "GET" && segments[3] === "chat") {
@@ -725,6 +1143,34 @@ async function handle(req, res) {
     } catch (error) { return json(res, error.statusCode || 400, { error: error.message, status: project.status }); }
   }
   if (req.method === "POST" && segments[3] === "render") {
+    if (project.workflowMode === "multi-asset-v1") {
+      if (!project.multiAssetPlan?.confirmed) return json(res, 409, { error: "请先检查并确认多素材剪辑方案", status: project.status });
+      if (!project.multiAssetPreview?.qc?.passed || Number(project.multiAssetPreview.planVersion) !== Number(project.multiAssetPlan.version) || Number(project.multiAssetPreview.inputRevision) !== Number(project.multiAssetRevision || 0)) return json(res, 409, { error: "请先生成并检查当前方案和素材配置的横竖屏预览", status: project.status });
+      const expectedReviewedProfiles = project.multiAssetPreview.profiles.map((profile) => profile.id).sort();
+      const reviewedProfiles = project.multiAssetPreviewReview?.planVersion === project.multiAssetPlan.version && Number(project.multiAssetPreviewReview.inputRevision) === Number(project.multiAssetRevision || 0) ? [...new Set(project.multiAssetPreviewReview.profiles || [])].sort() : [];
+      if (JSON.stringify(reviewedProfiles) !== JSON.stringify(expectedReviewedProfiles)) return json(res, 409, { error: "请逐个播放检查当前方案的所有横竖屏预览后，再导出正式成片", status: project.status });
+      if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "当前已有制作任务，请等待本轮完成后再导出" });
+      project.status = "rendering";
+      project.error = null;
+      await save(project);
+      publish(project.id, { type: "stage", status: project.status, message: "正在以正式分辨率渲染横屏和竖屏成片并执行 QC" });
+      try {
+        const result = await renderMultiAssetProject(project);
+        project.artifacts = [...(project.artifacts || []), ...result.artifacts];
+        project.qc = result.qc;
+        project.editor = { engine: "wayne-multi-asset", model: "claude-plan + ffmpeg-render", version: result.qc.version, phase: "multi-asset-render" };
+        project.status = "completed";
+        await save(project);
+        publish(project.id, { type: "stage", status: project.status, message: "横屏和竖屏成片已生成并通过 QC，请观看验收" });
+        return json(res, 200, projectView(project));
+      } catch (error) {
+        project.status = "failed";
+        project.error = error.message;
+        await save(project);
+        publish(project.id, { type: "failed", status: project.status, message: error.message });
+        return json(res, 502, { error: error.message, status: project.status, project: projectView(project) });
+      }
+    }
     if (!project.plan) return json(res, 409, { error: "请先生成并确认剪辑计划", status: project.status });
     if (["planning", "rendering", "chat_editing"].includes(project.status) || project.editSession?.status === "running") return json(res, 409, { error: "当前已有制作任务，请等待本轮完成后再导出" });
     if (["needs_review", "manual_review_required"].includes(project.proofreading?.status)) return json(res, 409, { error: "字幕仍有待确认内容，请先完成字幕校对", status: project.status });

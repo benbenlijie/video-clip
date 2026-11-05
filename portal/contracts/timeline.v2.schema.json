@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/timeline.v2.schema.json",
+  "title": "Wayne timeline.v2",
+  "type": "object",
+  "required": ["contract", "project", "brief", "assets", "audio", "profiles", "durationMs", "clips", "overlays", "summary"],
+  "properties": {
+    "contract": { "const": "timeline.v2" },
+    "project": {
+      "type": "object",
+      "required": ["id", "workflowMode", "goal", "style", "version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "workflowMode": { "const": "multi-asset-v1" },
+        "goal": { "type": "string" },
+        "style": { "type": "string" },
+        "version": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "brief": { "type": "object" },
+    "audio": {
+      "type": "object",
+      "required": ["sourcePolicy", "music"],
+      "properties": {
+        "sourcePolicy": { "const": "retain-source-audio-or-silence" },
+        "music": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["filename", "licenseConfirmed", "sha256"],
+              "properties": {
+                "filename": { "type": "string" },
+                "licenseConfirmed": { "type": "boolean" },
+                "sha256": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["id", "filename", "durationMs", "width", "height", "hasAudio", "hasVideo", "role", "label", "licenseConfirmed", "sha256", "transcriptRef", "visualEvidence"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "filename": { "type": "string" },
+          "durationMs": { "type": "integer", "minimum": 1 },
+          "width": { "type": "integer", "minimum": 1 },
+          "height": { "type": "integer", "minimum": 1 },
+          "hasAudio": { "type": "boolean" },
+          "hasVideo": { "type": "boolean" },
+          "role": { "enum": ["main", "supporting", "broll", "voiceover"] },
+          "label": { "type": "string" },
+          "licenseConfirmed": { "type": "boolean" },
+          "sha256": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+          "transcriptRef": { "type": "string", "pattern": "^assets/[a-zA-Z0-9_-]+/transcript\\.json$" },
+          "visualEvidence": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "required": ["filename", "keyframeTimesMs", "width", "height"],
+                "properties": {
+                  "filename": { "type": "string" },
+                  "keyframeTimesMs": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 } },
+                  "width": { "type": "integer", "minimum": 1 },
+                  "height": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["id", "width", "height", "fps", "codec", "audioCodec"],
+        "properties": {
+          "id": { "enum": ["landscape", "portrait"] },
+          "width": { "enum": [1920, 1080] },
+          "height": { "enum": [1080, 1920] },
+          "fps": { "const": 30 },
+          "codec": { "const": "h264" },
+          "audioCodec": { "const": "aac" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "durationMs": { "type": "integer", "minimum": 1 },
+    "clips": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["id", "sourceAssetId", "sourceInMs", "sourceOutMs", "timelineStartMs", "timelineEndMs", "track", "purpose", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "sourceAssetId": { "type": "string", "minLength": 1 },
+          "sourceInMs": { "type": "integer", "minimum": 0 },
+          "sourceOutMs": { "type": "integer", "minimum": 1 },
+          "timelineStartMs": { "type": "integer", "minimum": 0 },
+          "timelineEndMs": { "type": "integer", "minimum": 1 },
+          "track": { "enum": ["video-main", "video-overlay"] },
+          "purpose": { "type": "string" },
+          "reason": { "type": "string" },
+          "audioPolicy": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "overlays": { "type": "array" },
+    "summary": { "type": "string" }
+  },
+  "additionalProperties": false
+}

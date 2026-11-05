@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, resolve, sep } from "node:path";
 
 function serializableProject(project) {
@@ -22,7 +23,7 @@ export function createProjectStore(storageRoot) {
     await ensureRoot();
     const dir = project.dir ?? projectDir(project.id);
     await fs.mkdir(dir, { recursive: true });
-    const tempPath = join(dir, ".project.json.tmp");
+    const tempPath = join(dir, `.project.${randomUUID()}.tmp`);
     await fs.writeFile(tempPath, JSON.stringify(serializableProject(project), null, 2), "utf8");
     await fs.rename(tempPath, join(dir, "project.json"));
     project.dir = dir;
@@ -63,4 +64,3 @@ export function createProjectStore(storageRoot) {
 
   return { root, projects, ensureRoot, saveProject, loadProjects, get, artifactPath, projectDir };
 }
-

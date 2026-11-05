@@ -166,12 +166,12 @@ async function transcribeTencent(audioBytes) {
   throw new Error("腾讯云 ASR 任务轮询超时");
 }
 
-export async function transcribeVideo({ videoPath, projectDir, projectId, onPass = () => undefined }) {
-  const audioPath = `${projectDir}/transcript-audio.wav`;
+export async function transcribeVideo({ videoPath, projectDir, projectId, audioPath: requestedAudioPath = null, publicAudioUrl = null, onPass = () => undefined }) {
+  const audioPath = requestedAudioPath || `${projectDir}/transcript-audio.wav`;
   const audio = await extractAudio(videoPath, audioPath);
   const cfg = config(); const state = providerState();
   const audioSha256 = sha256(audio);
-  const standardAudioUrl = cfg.volcengine.publicBaseUrl ? `${cfg.volcengine.publicBaseUrl.replace(/\/$/, "")}/media/${projectId}/transcript-audio.wav` : "";
+  const standardAudioUrl = publicAudioUrl || (cfg.volcengine.publicBaseUrl ? `${cfg.volcengine.publicBaseUrl.replace(/\/$/, "")}/media/${projectId}/transcript-audio.wav` : "");
   const tryVolc = cfg.provider !== "tencent" && state.volcengine;
   const tryTencent = state.tencent;
   const attempts = [];

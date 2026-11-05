@@ -84,6 +84,9 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 - `POST /api/projects`：创建 Wayne 工作流项目；
 - `POST /api/projects/:id/input`：接收 multipart 视频并通过 FFprobe 读取媒体信息；
 - `POST /api/projects/:id/input/chunk` + `POST /api/projects/:id/input/complete`：移动端使用 8MB 分块上传，支持中断后从已确认字节继续；
+- `POST /api/projects/:id/assets` + `/assets/:assetId/chunk` + `/assets/:assetId/complete`：多素材工作流逐段上传视频，支持 8MB 分块重试和独立状态；
+- `GET /api/projects/:id/assets`、`PUT /api/projects/:id/assets/:assetId`、`PUT /api/projects/:id/brief`：读取/修改素材角色与授权，保存剪辑方案；
+- `POST /api/projects/:id/analyze`、`POST /api/projects/:id/plan`、`POST /api/projects/:id/plan/confirm`、`POST /api/projects/:id/plan/restore`、`POST /api/projects/:id/preview`、`POST /api/projects/:id/render`：逐素材转录、生成/确认方案、横竖屏预览 QC 和正式成片导出；
 - `POST /api/projects/:id/music`：可选上传 MP3/WAV/M4A/AAC/OGG/FLAC（最多 50MB），要求确认音乐使用许可；项目 API 不会泄露本地文件路径；
 - `POST /api/projects/:id/broll`：可上传 MP4/MOV/M4V/WebM B-roll（最多 100MB/个），需确认素材使用许可；Claude 只会在已上传素材中安排时间点，缺少素材时返回空列表；
 - `POST /api/projects/:id/broll/search`：保留手动候选搜索入口；正式 Claude Code 剪辑由 Opus 自己调用 MCP 搜索、查看和下载，搜索结果、实际下载、计划插入和最终审片分别记录；
@@ -109,6 +112,17 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 对话会话保存在项目的 `editSession` 中，编辑工作区会复用同一份 Claude Code 工程并保存每轮的输入、会话 ID、审片证据和 QC。只有新版本通过 QC 才会推进 `latestVersion`；失败时上一版仍然是当前可编辑版本。前端的“查看版本”只切换播放内容，下一轮修改仍以页面明确显示的最新版本为基准。
 
 上传接口限制单文件 500MB；原始 MP4 和成片路由支持 HTTP Range，浏览器可以拖动预览。健康接口只返回服务能力状态，不暴露项目数量或密钥。
+
+### 双入口与多素材方案剪辑
+
+开始页分为两个独立入口：
+
+- **口播视频剪辑**继续使用 `workflowMode: "single-video-v1"`、`project.media`、旧 `/input` 上传、现有 Claude 工程和既有导出格式。没有 `workflowMode` 的历史项目也按此模式读取。
+- **多素材方案剪辑**使用 `workflowMode: "multi-asset-v1"` 和独立 `assets[]`，至少 2 段视频，最多 20 段，单段最大 500MB，项目总计最大 5GB。原始文件存放在 `storage/<projectId>/assets/<assetId>/`，不会覆盖旧 `input.mp4`。
+
+多素材项目逐条 FFprobe、ASR 和真实关键帧分析，分析失败时保留已完成结果并阻止生成方案；再次分析会跳过已成功素材。Claude 同时依据用户方案、逐素材转录和关键帧联系图生成跨素材时间轴。`GET /api/projects/:id/timeline` 根据模式返回 `timeline.v1` 或 `timeline.v2`；v1 契约保持不变。用户确认方案后，先由 FFmpeg 生成横屏 960×540 和竖屏 540×960 预览；预览通过尺寸、音画同步、黑帧和目标时长检查且用户播放审阅后，才允许导出正式横屏 1920×1080 和竖屏 1080×1920 成片（用户可指定单一画幅），正式输出为 30fps H.264/AAC。方案修改会使此前预览失效；旧方案和各版本预览/导出产物会保留，历史方案恢复后需要再次确认和预览。
+
+独立音频和图片、多机位同步及复杂转场暂不属于多素材首版。高级用户的 OpenChatCut/NLE 路线 C 仍为未来阶段；本轮不会自动切换编辑器或传输媒体。
 
 ### 状态与真实能力
 

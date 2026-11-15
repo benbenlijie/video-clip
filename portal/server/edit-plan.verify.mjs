@@ -1,5 +1,40 @@
 import assert from "node:assert/strict";
 import { normalizeEditPlan, validateEditPlan } from "./edit-plan.mjs";
+import * as editPlanModule from "./edit-plan.mjs";
+
+assert.equal(typeof editPlanModule.protectTranscriptCorrections, "function", "protected transcript corrections must be normalized before rendering");
+const protectTranscriptCorrections = editPlanModule.protectTranscriptCorrections;
+const protectedTranscript = { segments: [{ id: "corrected-line", startMs: 250, endMs: 750, text: "校对后的句子", wordTimingStatus: "protected" }] };
+const snappedPlan = protectTranscriptCorrections({ segments: [
+  { id: "keep-before", startMs: 0, endMs: 300, action: "keep", title: "Before", note: "" },
+  { id: "trim-middle", startMs: 300, endMs: 700, action: "remove", title: "Trim", note: "" },
+  { id: "keep-after", startMs: 700, endMs: 1000, action: "keep", title: "After", note: "" },
+] }, protectedTranscript);
+assert.deepEqual(snappedPlan.adjustedSegmentIds, ["corrected-line"]);
+assert.deepEqual(snappedPlan.plan.segments, [
+  { id: "keep-before", startMs: 0, endMs: 250, action: "keep", title: "Before", note: "" },
+  { id: "protected-transcript-1", startMs: 250, endMs: 750, action: "keep", title: "字幕修订整句", note: "系统自动保留未能精确对齐的校对片段" },
+  { id: "keep-after", startMs: 750, endMs: 1000, action: "keep", title: "After", note: "" },
+]);
+assert.equal(new Set(snappedPlan.plan.segments.map((segment) => segment.id)).size, snappedPlan.plan.segments.length, "splitting a plan interval keeps every executable segment id unique");
+assert.deepEqual(protectTranscriptCorrections({ segments: [{ startMs: 250, endMs: 750, action: "keep", title: "Whole", note: "" }] }, protectedTranscript).adjustedSegmentIds, [], "already-whole retained corrections need no plan change");
+assert.deepEqual(protectTranscriptCorrections({ segments: [{ startMs: 250, endMs: 750, action: "remove", title: "Whole delete", note: "" }] }, protectedTranscript).adjustedSegmentIds, [], "a full-sentence deletion remains valid");
+const legacyCorrectedTranscript = { segments: [{ id: "legacy-corrected", startMs: 100, endMs: 500, text: "已经修订的字幕", words: [{ startMs: -1, endMs: -1, text: "旧识别字幕" }] }] };
+const legacyProtectedPlan = protectTranscriptCorrections({ segments: [{ id: "partial", startMs: 200, endMs: 400, action: "keep" }] }, legacyCorrectedTranscript);
+assert.deepEqual(legacyProtectedPlan.adjustedSegmentIds, ["legacy-corrected"], "legacy corrections without the new marker are inferred from stale or invalid ASR word timings");
+assert.deepEqual(legacyProtectedPlan.plan.segments.map(({ startMs, endMs, action }) => ({ startMs, endMs, action })), [{ startMs: 100, endMs: 500, action: "keep" }]);
+assert.deepEqual(protectTranscriptCorrections({ segments: [{ startMs: 100, endMs: 500, action: "keep" }] }, { segments: [{ id: "unworded", startMs: 100, endMs: 500, text: "整句保留" }] }).adjustedSegmentIds, [], "an unworded sentence already kept whole needs no plan change");
+const adjacentProtected = protectTranscriptCorrections({ segments: [
+  { id: "delete-first", startMs: 0, endMs: 100, action: "remove", title: "Delete first", note: "" },
+  { id: "partial-second", startMs: 150, endMs: 200, action: "keep", title: "Keep second tail", note: "" },
+] }, { segments: [
+  { id: "first", startMs: 0, endMs: 100, text: "整句删除", wordTimingStatus: "protected" },
+  { id: "second", startMs: 100, endMs: 200, text: "另一句需要保留", wordTimingStatus: "protected" },
+] });
+assert.deepEqual(adjacentProtected.plan.segments.map(({ startMs, endMs, action }) => ({ startMs, endMs, action })), [
+  { startMs: 0, endMs: 100, action: "remove" },
+  { startMs: 100, endMs: 200, action: "keep" },
+], "adjacent protected sentences stay independent so one can be deleted while the other is retained");
 
 const base = {
   summary: "论文 Hook 后解释核心观点，再收尾引导互动。",

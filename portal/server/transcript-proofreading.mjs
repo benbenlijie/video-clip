@@ -18,6 +18,25 @@ export function transcriptFingerprint(transcript) {
   })).digest("hex");
 }
 
+export function findUnverifiablePartialTranscriptSegments(transcript, plan, editPieces = null) {
+  const keeps = editPieces ? editPieces.map((piece) => ({ startMs: piece.src[0], endMs: piece.src[1] })) : (plan?.segments || []).filter((cut) => cut.action !== "remove");
+  return (transcript?.segments || []).filter((source) => {
+    const overlapping = keeps.filter((cut) => Number(cut.endMs) > Number(source.startMs) && Number(cut.startMs) < Number(source.endMs));
+    if (!overlapping.length) return false;
+    if (source.wordTimingStatus === "protected") return !coversInterval(overlapping.filter((cut) => cut.action !== "remove"), Number(source.startMs), Number(source.endMs));
+    let retainedUntil = Number(source.startMs);
+    for (const cut of overlapping.sort((a, b) => Number(a.startMs) - Number(b.startMs))) {
+      if (Number(cut.startMs) > retainedUntil + 0.01) break;
+      retainedUntil = Math.max(retainedUntil, Number(cut.endMs));
+      if (retainedUntil >= Number(source.endMs)) return false;
+    }
+    const words = Array.isArray(source.words)
+      ? source.words.filter((word) => Number(word.startMs) >= 0 && Number(word.endMs) > Number(word.startMs) && typeof word.text === "string" && word.text.trim())
+      : [];
+    return !words.length || normalized(words.map((word) => word.text).join("")) !== normalized(source.text);
+  }).map((source) => source.id);
+}
+
 function assertTranscriptShape(transcript, label) {
   if (!transcript || !Array.isArray(transcript.segments) || !transcript.segments.length) throw new Error(`${label} transcript segments missing`);
   let previousStart = -1;
@@ -54,6 +73,16 @@ function overlappingText(transcript, segment) {
 function supportedBy(text, sourceText) {
   const needle = normalized(text);
   return needle && normalized(sourceText).includes(needle);
+}
+
+function coversInterval(intervals, startMs, endMs) {
+  let cursor = startMs;
+  for (const interval of [...intervals].sort((a, b) => Number(a.startMs) - Number(b.startMs))) {
+    if (Number(interval.startMs) > cursor + 0.01) return false;
+    cursor = Math.max(cursor, Number(interval.endMs));
+    if (cursor >= endMs) return true;
+  }
+  return false;
 }
 
 export function validateProofreadResult(result, primary, secondary) {
@@ -137,14 +166,31 @@ export function subtitlesMatchTranscript(srt, transcript, plan, visualSourceText
     return cut ? { ...cue, sourceStartMs: cue.startMs, sourceEndMs: cue.endMs } : null;
   };
   const mapInEditedTime = (cue) => {
-    const range = editedMap.find((item) => cue.startMs >= item.editedStartMs && cue.startMs < item.editedEndMs);
-    if (!range) return null;
-    const endMs = Math.min(cue.endMs, range.editedEndMs);
-    if (cue.endMs - endMs > 400 || endMs <= cue.startMs) return null;
-    return { ...cue, sourceStartMs: range.sourceStartMs + cue.startMs - range.editedStartMs, sourceEndMs: range.sourceStartMs + endMs - range.editedStartMs };
+    const ranges = [];
+    let cursorMs = cue.startMs;
+    while (cursorMs < cue.endMs - 0.01) {
+      const range = editedMap.find((item) => cursorMs >= item.editedStartMs - 0.01 && cursorMs < item.editedEndMs - 0.01);
+      if (!range) {
+        if (cue.endMs - cursorMs <= 400) break;
+        return null;
+      }
+      const endMs = Math.min(cue.endMs, range.editedEndMs);
+      if (endMs <= cursorMs) return null;
+      ranges.push({
+        sourceStartMs: range.sourceStartMs + cursorMs - range.editedStartMs,
+        sourceEndMs: range.sourceStartMs + endMs - range.editedStartMs,
+      });
+      cursorMs = endMs;
+    }
+    const lastRange = ranges.at(-1);
+    if (!lastRange || cue.endMs - cursorMs > 400) return null;
+    return { ...cue, sourceStartMs: ranges[0].sourceStartMs, sourceEndMs: lastRange.sourceEndMs, sourceIntervals: ranges };
   };
   const contentMatchesTime = (mapped) => mapped.every((cue) => {
-    const overlapping = (transcript?.segments || []).filter((source) => Number(source.endMs) > cue.sourceStartMs && Number(source.startMs) < cue.sourceEndMs);
+    const sourceIntervals = cue.sourceIntervals || [{ sourceStartMs: cue.sourceStartMs, sourceEndMs: cue.sourceEndMs }];
+    const overlapsSource = (source) => sourceIntervals.some((interval) => Number(source.endMs) > interval.sourceStartMs && Number(source.startMs) < interval.sourceEndMs);
+    const overlapsInterval = (word) => sourceIntervals.some((interval) => Number(word.endMs) > interval.sourceStartMs && Number(word.startMs) < interval.sourceEndMs);
+    const overlapping = (transcript?.segments || []).filter(overlapsSource);
     if (!overlapping.length) return false;
     const segmentEvidence = normalized(overlapping.map((source) => source.text).join(""));
     const cueText = normalized(cue.text);
@@ -153,7 +199,7 @@ export function subtitlesMatchTranscript(srt, transcript, plan, visualSourceText
       : []);
     const wordTimingUsable = validWordGroups.every((words, index) => words.length && normalized(words.map((word) => word.text || "").join("")) === normalized(overlapping[index].text));
     if (!wordTimingUsable) return segmentEvidence.includes(cueText);
-    const timedEvidence = normalized(validWordGroups.flat().filter((word) => Number(word.endMs) > cue.sourceStartMs && Number(word.startMs) < cue.sourceEndMs).map((word) => word.text || "").join(""));
+    const timedEvidence = normalized(validWordGroups.flat().filter(overlapsInterval).map((word) => word.text || "").join(""));
     return timedEvidence.includes(cueText);
   });
   const sourceMapped = cues.map(mapInSourceTime).filter(Boolean);
@@ -174,7 +220,7 @@ export function subtitlesMatchTranscript(srt, transcript, plan, visualSourceText
           retained.push({ key: `${source.id}:word:${index}`, startMs: Number(word.startMs), endMs: Number(word.endMs), text: word.text });
         }
       }
-    } else if (overlapping.some((cut) => Number(cut.startMs) <= Number(source.startMs) && Number(cut.endMs) >= Number(source.endMs))) {
+    } else if (coversInterval(overlapping, Number(source.startMs), Number(source.endMs))) {
       retained.push({ key: `${source.id}:segment`, startMs: Number(source.startMs), endMs: Number(source.endMs), text: source.text });
     } else {
       return false;
@@ -192,17 +238,31 @@ export function subtitlesMatchTranscript(srt, transcript, plan, visualSourceText
     if (!event || !Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < Number(event.startMs) || endMs > Number(event.endMs) || endMs <= startMs || !text.trim()) return false;
     if (!visualSourceTexts.some((sourceText) => visibleText(sourceText).includes(normalized(text)))) return false;
     if (editPieces) {
-      if (!Array.isArray(renderedEvents)) return false;
-      const candidates = renderedEvents.filter((actual) => actual.sourceEventId === item.eventId && normalized(`${actual.text || ""} ${actual.subtext || ""}`).includes(normalized(text)));
-      const intervals = editPieces.flatMap((piece) => {
-        const start = Math.max(startMs, piece.src[0]);
-        const end = Math.min(endMs, piece.src[1]);
-        return end > start ? [[start - piece.src[0] + piece.out[0], end - piece.src[0] + piece.out[0]]] : [];
-      });
-      if (!intervals.length || intervals.some(([start, end]) => !candidates.some((actual) => actual.startMs <= start + 0.01 && actual.endMs >= end - 0.01))) return false;
+      if (Array.isArray(renderedEvents)) {
+        const candidates = renderedEvents.filter((actual) => actual.sourceEventId === item.eventId && normalized(`${actual.text || ""} ${actual.subtext || ""}`).includes(normalized(text)));
+        const intervals = editPieces.flatMap((piece) => {
+          const start = Math.max(startMs, piece.src[0]);
+          const end = Math.min(endMs, piece.src[1]);
+          return end > start ? [[start - piece.src[0] + piece.out[0], end - piece.src[0] + piece.out[0]]] : [];
+        });
+        if (!intervals.length || intervals.some(([start, end]) => !candidates.some((actual) => actual.startMs <= start + 0.01 && actual.endMs >= end - 0.01))) return false;
+      }
     }
     const words = retained.filter((word) => word.startMs >= startMs && word.endMs <= endMs);
-    if (!words.length || retained.some((word) => word.startMs < endMs && word.endMs > startMs && !words.includes(word))) return false;
+    const segmentToken = retained.find((word) => word.key.endsWith(":segment") && word.startMs < endMs && word.endMs > startMs && !coveredKeys.has(word.key));
+    if (!words.length && !segmentToken) return false;
+    if (segmentToken) {
+      if (startMs < segmentToken.startMs || endMs > segmentToken.endMs || !normalized(segmentToken.text).includes(normalized(text))) return false;
+      const sourceText = normalized(segmentToken.text);
+      const coveredText = normalized(text);
+      const offset = sourceText.indexOf(coveredText);
+      if (offset < 0) return false;
+      const remainingText = `${sourceText.slice(0, offset)}${sourceText.slice(offset + coveredText.length)}`;
+      segmentToken.text = remainingText;
+      coveredKeys.add(`${segmentToken.key}:covered`);
+      continue;
+    }
+    if (retained.some((word) => word.startMs < endMs && word.endMs > startMs && !words.includes(word))) return false;
     if (normalized(words.map((word) => word.text).join("")) !== normalized(text) || words.some((word) => coveredKeys.has(word.key))) return false;
     words.forEach((word) => coveredKeys.add(word.key));
   }

@@ -1,5 +1,51 @@
 import assert from "node:assert/strict";
 import { applyTranscriptReview, ensureTranscriptReviewState } from "./transcript-review.mjs";
+const timingModule = await import("./transcript-word-timing.mjs").catch(() => ({}));
+assert.equal(typeof timingModule.remapWordTimings, "function", "manual transcript edits need an ASR-anchored word timing remapper");
+const { remapWordTimings } = timingModule;
+
+assert.deepEqual(remapWordTimings({ previousText: "甲乙丙", nextText: "甲丁丙", words: [{ startMs: 100, endMs: 400, text: "甲乙丙" }], startMs: 100, endMs: 400 }), [
+  { startMs: 100, endMs: 200, text: "甲" },
+  { startMs: 200, endMs: 300, text: "丁" },
+  { startMs: 300, endMs: 400, text: "丙" },
+], "a one-character correction changes only the original character's time span");
+assert.deepEqual(remapWordTimings({ previousText: "甲乙丙", nextText: "甲乙新丙", words: [{ startMs: 100, endMs: 400, text: "甲乙丙" }], startMs: 100, endMs: 400 }), [
+  { startMs: 100, endMs: 175, text: "甲" },
+  { startMs: 175, endMs: 250, text: "乙" },
+  { startMs: 250, endMs: 325, text: "新" },
+  { startMs: 325, endMs: 400, text: "丙" },
+], "inserted characters share the nearest ASR word's original time range");
+assert.deepEqual(remapWordTimings({ previousText: "乙丙", nextText: "甲乙丙", words: [{ startMs: 0, endMs: 300, text: "乙丙" }], startMs: 0, endMs: 300 }), [
+  { startMs: 0, endMs: 100, text: "甲" },
+  { startMs: 100, endMs: 200, text: "乙" },
+  { startMs: 200, endMs: 300, text: "丙" },
+], "a leading insertion borrows time from the nearest ASR word");
+assert.deepEqual(remapWordTimings({ previousText: "甲乙", nextText: "甲乙丙", words: [{ startMs: 0, endMs: 300, text: "甲乙" }], startMs: 0, endMs: 300 }), [
+  { startMs: 0, endMs: 100, text: "甲" },
+  { startMs: 100, endMs: 200, text: "乙" },
+  { startMs: 200, endMs: 300, text: "丙" },
+], "a trailing insertion borrows time from the nearest ASR word");
+assert.deepEqual(remapWordTimings({ previousText: "甲乙丙丁", nextText: "甲丙丁", words: [{ startMs: 100, endMs: 500, text: "甲乙丙丁" }], startMs: 100, endMs: 500 }), [
+  { startMs: 100, endMs: 200, text: "甲" },
+  { startMs: 300, endMs: 400, text: "丙" },
+  { startMs: 400, endMs: 500, text: "丁" },
+], "deleting a character leaves unchanged characters at their original positions");
+assert.deepEqual(remapWordTimings({ previousText: "A👩🏽‍💻B", nextText: "A👩🏽‍💻D", words: [{ startMs: 0, endMs: 300, text: "A👩🏽‍💻B" }], startMs: 0, endMs: 300 }), [
+  { startMs: 0, endMs: 100, text: "A" },
+  { startMs: 100, endMs: 200, text: "👩🏽‍💻" },
+  { startMs: 200, endMs: 300, text: "D" },
+], "Unicode grapheme clusters stay intact while mapping changed text");
+assert.deepEqual(remapWordTimings({ previousText: "哈哈哈", nextText: "哈哈呀", words: [{ startMs: 0, endMs: 300, text: "哈哈哈" }], startMs: 0, endMs: 300 }), [
+  { startMs: 0, endMs: 100, text: "哈" },
+  { startMs: 100, endMs: 200, text: "哈" },
+  { startMs: 200, endMs: 300, text: "呀" },
+], "repeated graphemes retain a monotonic alignment");
+assert.deepEqual(remapWordTimings({ previousText: "甲乙!", nextText: "甲，乙。", words: [{ startMs: 0, endMs: 200, text: "甲乙" }], startMs: 0, endMs: 200 }), [
+  { startMs: 0, endMs: 100, text: "甲" },
+  { startMs: 100, endMs: 200, text: "乙" },
+], "punctuation-only changes keep the spoken-word timing positions");
+assert.equal(remapWordTimings({ previousText: "甲乙", nextText: "甲丙", words: [{ startMs: 900, endMs: 1200, text: "甲乙" }], startMs: 100, endMs: 500 }), null, "word timing outside the source segment is not guessed");
+assert.equal(remapWordTimings({ previousText: "甲乙", nextText: "甲丙", words: [null], startMs: 100, endMs: 500 }), null, "malformed ASR word entries use protected fallback instead of throwing");
 
 const legacy = { transcript: { text: "legacy transcript", segments: [{ id: "segment-1", startMs: 0, endMs: 1000, text: "legacy transcript" }] }, plan: { segments: [] } };
 assert.equal(ensureTranscriptReviewState(legacy), true);
@@ -33,6 +79,17 @@ assert.equal(result.proofreading.manualCorrections[0].before, "然后检查字�
 assert.equal(result.proofreading.resolvedUnresolved[0].resolution, "user-corrected");
 assert.equal(result.proofreading.resolvedUnresolved[0].secondaryText, "然后检查字母");
 assert.deepEqual(transcript, originalSnapshot, "review edits must not mutate the caller's original transcript");
+
+const timedTranscript = { text: "甲乙丙", segments: [{ id: "timed", startMs: 100, endMs: 400, text: "甲乙丙", words: [{ startMs: 100, endMs: 400, text: "甲乙丙" }] }] };
+const timedEdit = applyTranscriptReview({ transcript: timedTranscript, proofreading: { status: "confirmed", changes: [], unresolved: [] }, segments: [{ ...timedTranscript.segments[0], text: "甲丁丙" }] });
+assert.deepEqual(timedEdit.transcript.segments[0].words, [
+  { startMs: 100, endMs: 200, text: "甲" },
+  { startMs: 200, endMs: 300, text: "丁" },
+  { startMs: 300, endMs: 400, text: "丙" },
+]);
+assert.equal(timedEdit.transcript.segments[0].wordTimingStatus, "estimated");
+const noTimingEdit = applyTranscriptReview({ transcript, proofreading: { status: "confirmed", changes: [], unresolved: [] }, segments: [{ ...transcript.segments[0], text: "改过的内容" }, transcript.segments[1]] });
+assert.equal(noTimingEdit.transcript.segments[0].wordTimingStatus, "protected", "unavailable source word times protect the utterance instead of inventing precision");
 
 assert.throws(() => applyTranscriptReview({ transcript, proofreading, segments: submitted, confirmedUnresolvedSegmentIds: [] }), /确认|confirm/i);
 assert.throws(() => applyTranscriptReview({ transcript, proofreading, segments: [{ ...submitted[0], endMs: -1 }, submitted[1]], confirmedUnresolvedSegmentIds: ["segment-2"] }), /时间|timestamp/i);

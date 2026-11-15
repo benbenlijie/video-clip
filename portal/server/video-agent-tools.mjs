@@ -13,6 +13,7 @@ import { toTimelineV1 } from "./timeline-contract.mjs";
 import { registerBrollTools } from "./video-broll-tools.mjs";
 import { workspacePath } from "./workspace-path.mjs";
 import { composeRemotionMain } from "./remotion-main.mjs";
+import { protectTranscriptCorrections } from "./edit-plan.mjs";
 
 const portalRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -57,23 +58,47 @@ export async function sandboxCommand(workDir, command, timeoutMs = 180000) {
 export async function startMediaTools(workDir, auditPath) {
   const root = await fs.realpath(workDir);
   const audit = async (entry) => fs.appendFile(auditPath, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  const protectWorkspacePlan = async (source) => {
+    let planText;
+    try { planText = await fs.readFile(await workspacePath(root, "edit-plan.json"), "utf8"); }
+    catch (error) { if (error.code === "ENOENT") return []; throw error; }
+    const transcript = JSON.parse(await fs.readFile(await workspacePath(root, "transcript.json"), "utf8"));
+    const currentPlan = JSON.parse(planText);
+    const { plan, adjustedSegmentIds } = protectTranscriptCorrections(currentPlan, transcript);
+    if (!adjustedSegmentIds.length) return [];
+    await fs.writeFile(await workspacePath(root, "edit-plan.json"), JSON.stringify(plan, null, 2));
+    await audit({ tool: "protect_transcript_corrections", source, adjustedSegmentIds });
+    return adjustedSegmentIds;
+  };
   let remotionPreviewCount = 0;
   const server = new McpServer({ name: "video-editing", version: "1.0.0" });
   registerBrollTools(server, { workspaceDir: root, auditPath: join(dirname(auditPath), "broll-audit.jsonl"), cachePath: join(dirname(auditPath), "broll-cache.json") });
   const register = (name, description, inputSchema, handler) => server.registerTool(name, { description, inputSchema }, async (args) => {
     try { return await handler(args); } catch (error) { await audit({ tool: name, error: error.message }); return { isError: true, content: [{ type: "text", text: error.message }] }; }
   });
-  register("execute", "Run FFmpeg, FFprobe, Python, Node or HyperFrames commands in an isolated Linux workspace. Only /work is writable. This host-compatible fallback inherits the parent network namespace, so do not fetch or upload project data. Paths: /work, /tools/node, /tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs. Write your own scripts; inspect and iterate.", { command: z.string().max(30000), timeoutSeconds: z.number().min(1).max(240).default(180) }, async ({ command, timeoutSeconds }) => {
+  register("execute", "Run FFmpeg, FFprobe, Python, Node or HyperFrames commands in an isolated Linux workspace. Only /work is writable. This host-compatible fallback inherits the parent network namespace, so do not fetch or upload project data. Paths: /work, /tools/node, /tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs. Write your own scripts; inspect and iterate. Protected transcript intervals are normalized before and after each command. If normalization happens after a command that also rendered media, rerender with the saved plan.", { command: z.string().max(30000), timeoutSeconds: z.number().min(1).max(240).default(180) }, async ({ command, timeoutSeconds }) => {
+    const protectedBefore = await protectWorkspacePlan("before-execute");
+    if (protectedBefore.length) {
+      await audit({ tool: "execute", command, blocked: true, reason: "protected-transcript-plan-changed", adjustedSegmentIds: protectedBefore });
+      return { isError: false, content: [{ type: "text", text: `系统已自动保护字幕片段 ${protectedBefore.join(", ")}。请先重新读取 edit-plan.json 并重新生成 timeline.json/媒体输出，再执行原命令。` }] };
+    }
     const result = await sandboxCommand(root, command, timeoutSeconds * 1000);
     await audit({ tool: "execute", command, code: result.code, timedOut: result.timedOut });
-    return { isError: result.code !== 0, content: [{ type: "text", text: JSON.stringify(result) }] };
+    const protectedAfter = await protectWorkspacePlan("after-execute");
+    const adjusted = [...new Set([...protectedBefore, ...protectedAfter])];
+    const note = protectedAfter.length
+      ? `\n计划已自动保护字幕片段 ${protectedAfter.join(", ")}；本命令生成的输出需要基于新计划重新渲染。`
+      : adjusted.length ? `\n系统已自动保护字幕片段 ${adjusted.join(", ")}，后续渲染将使用完整片段。` : "";
+    return { isError: result.code !== 0, content: [{ type: "text", text: `${JSON.stringify(result)}${note}` }] };
   });
   register("write_file", "Create or update an editable script, subtitle file, composition HTML, edit plan or manifest inside the workspace. Use relative paths.", { path: z.string(), content: z.string().max(300000) }, async ({ path, content }) => {
     const target = await workspacePath(root, path, { existing: false });
     await fs.mkdir(dirname(target), { recursive: true });
     await fs.writeFile(target, content);
     await audit({ tool: "write_file", path });
-    return { content: [{ type: "text", text: `Written ${path}` }] };
+    const adjusted = path.replaceAll("\\", "/").split("/").at(-1) === "edit-plan.json" ? await protectWorkspacePlan("write-file") : [];
+    const note = adjusted.length ? `; automatically retained corrected utterance segments ${adjusted.join(", ")}` : "";
+    return { content: [{ type: "text", text: `Written ${path}${note}` }] };
   });
   register("read_file", "Read a UTF-8 script, skill, plan, transcript, manifest or command output from this edit workspace.", { path: z.string() }, async ({ path }) => {
     const target = await workspacePath(root, path);
@@ -82,6 +107,8 @@ export async function startMediaTools(workDir, auditPath) {
     return { content: [{ type: "text", text: await fs.readFile(target, "utf8") }] };
   });
   register("compose_remotion_video", "Compose the actual main preview/final from the already-cut baseVideo, timeline.json pieces (src/out in milliseconds), edit-plan.json, transcript.json and captions.srt. Reads the current phase and compositionMode from brief.json. Renders retained events on the EDITED timeline, burns the reviewed SRT, preserves audio, and returns a unique main MP4 plus retained alpha/source/hash evidence. Never use an uncut design comparison as the main video. Inspect the returned outputPath with view_frame and set manifest.main to that exact path, with compositionMode remotion-main.v1.", { baseVideo: z.string().min(1), phase: z.enum(["plan", "chat-edit", "render"]) }, async ({ baseVideo, phase }) => {
+    const protectedTranscriptSegmentIds = await protectWorkspacePlan("compose-remotion");
+    if (protectedTranscriptSegmentIds.length) return { content: [{ type: "text", text: JSON.stringify({ planAdjusted: true, protectedTranscriptSegmentIds, instruction: "The protected intervals changed the edit plan. Regenerate the base video and timeline.json from the saved edit-plan.json, then call compose_remotion_video again." }) }] };
     const result = await composeRemotionMain({ root, baseVideo, phase });
     await audit({ tool: "compose_remotion_video", ...result });
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
@@ -89,6 +116,8 @@ export async function startMediaTools(workDir, auditPath) {
   register("render_remotion_preview", "Render a comparison preview from the current edit-plan.json and input.mp4 using the Wayne timeline.v1 contract. Takes no paths or arbitrary code. Call after the plan is ready, inspect the returned MP4 with view_frame, and use the result only as a visual-design comparison; the normal Wayne preview and final export remain authoritative. At most two comparison renders per edit run.", {}, async () => {
     if (remotionPreviewCount >= 2) throw new Error("每轮最多生成两次 Remotion 对照预览");
     if (!(await remotionRuntimeAvailable())) throw new Error("Remotion runtime 尚未安装，本轮继续使用 Wayne 默认渲染流程");
+    const protectedTranscriptSegmentIds = await protectWorkspacePlan("render-remotion-preview");
+    if (protectedTranscriptSegmentIds.length) return { content: [{ type: "text", text: JSON.stringify({ planAdjusted: true, protectedTranscriptSegmentIds, instruction: "The protected intervals changed the edit plan. Reread edit-plan.json, regenerate the base video and timeline.json, then call render_remotion_preview again." }) }] };
     const [brief, transcript, assets, plan, brollAuditText] = await Promise.all([
       fs.readFile(await workspacePath(root, "brief.json"), "utf8").then(JSON.parse),
       fs.readFile(await workspacePath(root, "transcript.json"), "utf8").then(JSON.parse),
@@ -178,6 +207,7 @@ export async function startMediaTools(workDir, auditPath) {
       if (!qc.passed) throw new Error("Remotion 对照预览未通过 alpha、尺寸、时长、音画同步或黑帧检查");
       const result = {
         engine: "remotion",
+        protectedTranscriptSegmentIds,
         remotionVersion: overlay.remotionVersion,
         overlayPath: overlayRelative,
         previewPath: previewRelative,

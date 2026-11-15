@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { normalizeTranscriptText } from "./transcript-word-timing.mjs";
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, Number(value) || 0));
 
@@ -66,10 +67,130 @@ export function normalizeCaptionStyle(style) {
   return { ...value, color: value.color.toLowerCase() };
 }
 
+const LAYOUT_TYPES = new Set(["full", "punch_in", "split", "broll_cover", "unknown"]);
+
+function normalizeLayoutEvents(raw, duration) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw) || raw.length > 100) throw new Error("布局事件清单无效");
+  return raw.map((event, index) => {
+    if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error(`布局事件无效: ${index + 1}`);
+    const startMs = Number(event.startMs);
+    const endMs = Number(event.endMs);
+    const type = String(event.type || "unknown");
+    if (!LAYOUT_TYPES.has(type)) throw new Error(`布局事件类型无效: ${index + 1}`);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs <= startMs || endMs > duration) throw new Error(`布局事件时间无效: ${index + 1}`);
+    if (event.params != null && (typeof event.params !== "object" || Array.isArray(event.params))) throw new Error(`布局事件参数无效: ${index + 1}`);
+    return {
+      id: String(event.id || `layout-${index + 1}`),
+      type,
+      startMs: Math.round(startMs),
+      endMs: Math.round(endMs),
+      params: event.params ? { ...event.params } : {},
+    };
+  });
+}
+
+function normalizeStyleFields(plan) {
+  const fields = {};
+  if (plan.stylePackId != null) {
+    const id = String(plan.stylePackId);
+    if (!/^[a-z0-9][a-z0-9-]{2,80}$/.test(id)) throw new Error("stylePackId 无效");
+    fields.stylePackId = id;
+  }
+  if (plan.styleVersion != null) {
+    const version = Number(plan.styleVersion);
+    if (!Number.isInteger(version) || version < 1) throw new Error("styleVersion 无效");
+    fields.styleVersion = version;
+  }
+  if (plan.styleParameters != null) {
+    if (typeof plan.styleParameters !== "object" || Array.isArray(plan.styleParameters)) throw new Error("styleParameters 无效");
+    const parameters = {};
+    for (const [key, value] of Object.entries(plan.styleParameters)) {
+      if (!/^[a-zA-Z][a-zA-Z0-9_]{0,60}$/.test(key) || !["string", "number", "boolean"].includes(typeof value)) throw new Error(`styleParameters 无效: ${key}`);
+      parameters[key] = value;
+    }
+    fields.styleParameters = parameters;
+  }
+  return fields;
+}
+
+function intervalsCover(intervals, startMs, endMs) {
+  let coveredUntil = startMs;
+  for (const interval of [...intervals].sort((a, b) => Number(a.startMs) - Number(b.startMs))) {
+    if (Number(interval.startMs) > coveredUntil + 0.01) return false;
+    coveredUntil = Math.max(coveredUntil, Number(interval.endMs));
+    if (coveredUntil >= endMs) return true;
+  }
+  return false;
+}
+
+function transcriptSegmentNeedsProtection(segment) {
+  if (segment.wordTimingStatus === "protected") return true;
+  if (!Array.isArray(segment.words) || !segment.words.length) return true;
+  const startMs = Number(segment.startMs);
+  const endMs = Number(segment.endMs);
+  let previousEnd = startMs;
+  let text = "";
+  for (const word of segment.words) {
+    if (!word || typeof word !== "object" || Array.isArray(word)) return true;
+    const wordStart = Number(word.startMs);
+    const wordEnd = Number(word.endMs);
+    if (typeof word.text !== "string" || !Number.isFinite(wordStart) || !Number.isFinite(wordEnd) || wordStart < startMs || wordEnd > endMs || wordStart < previousEnd - 0.01 || wordEnd <= wordStart) return true;
+    previousEnd = wordEnd;
+    text += word.text;
+  }
+  return normalizeTranscriptText(text) !== normalizeTranscriptText(segment.text);
+}
+
+export function protectTranscriptCorrections(plan, transcript) {
+  let segments = Array.isArray(plan?.segments) ? plan.segments.map((segment) => ({ ...segment })) : [];
+  const protectedSegments = (transcript?.segments || [])
+    .filter((segment) => transcriptSegmentNeedsProtection(segment) && Number.isFinite(Number(segment.startMs)) && Number.isFinite(Number(segment.endMs)) && Number(segment.endMs) > Number(segment.startMs))
+    .map((segment) => ({ startMs: Number(segment.startMs), endMs: Number(segment.endMs), ids: [String(segment.id)] }))
+    .sort((a, b) => a.startMs - b.startMs);
+  const ranges = [];
+  for (const segment of protectedSegments) {
+    const last = ranges.at(-1);
+    if (last && segment.startMs < last.endMs - 0.01) {
+      last.endMs = Math.max(last.endMs, segment.endMs);
+      last.ids.push(...segment.ids);
+    } else ranges.push({ ...segment });
+  }
+  const adjustedSegmentIds = [];
+  for (const [index, range] of ranges.entries()) {
+    const overlapping = segments.filter((segment) => Number(segment.endMs) > range.startMs && Number(segment.startMs) < range.endMs);
+    const keepRanges = overlapping.filter((segment) => segment.action !== "remove");
+    const removeRanges = overlapping.filter((segment) => segment.action === "remove");
+    if (intervalsCover(keepRanges, range.startMs, range.endMs)) continue;
+    if (!keepRanges.length && intervalsCover(removeRanges, range.startMs, range.endMs)) continue;
+
+    const next = [];
+    for (const segment of segments) {
+      const startMs = Number(segment.startMs);
+      const endMs = Number(segment.endMs);
+      if (endMs <= range.startMs || startMs >= range.endMs) {
+        next.push(segment);
+        continue;
+      }
+      if (startMs < range.startMs) next.push({ ...segment, endMs: range.startMs });
+      if (endMs > range.endMs) next.push({ ...segment, startMs: range.endMs });
+    }
+    const ids = new Set(next.map((segment) => String(segment.id || "")));
+    let id = `protected-transcript-${index + 1}`;
+    while (ids.has(id)) id = `${id}-auto`;
+    next.push({ id, startMs: range.startMs, endMs: range.endMs, action: "keep", title: "字幕修订整句", note: "系统自动保留未能精确对齐的校对片段" });
+    segments = next.sort((a, b) => Number(a.startMs) - Number(b.startMs) || Number(a.endMs) - Number(b.endMs));
+    adjustedSegmentIds.push(...range.ids);
+  }
+  return { plan: segments === plan?.segments ? plan : { ...plan, segments }, adjustedSegmentIds };
+}
+
 export function validateEditPlan(plan, durationMs, { requireVisualEvents = false, requireFiveShorts = true, allowCustomVisualEvents = false, brollAssets = [] } = {}) {
   plan = normalizeEditPlan(plan, durationMs);
   if (!plan || !Array.isArray(plan.segments) || (requireFiveShorts && !Array.isArray(plan.shorts))) throw new Error("剪辑计划格式无效");
   const duration = Math.max(1, Number(durationMs) || 0);
+  const layoutEvents = normalizeLayoutEvents(plan.layoutEvents, duration);
+  const styleFields = normalizeStyleFields(plan);
   const segments = plan.segments.map((segment, index) => {
     const startMs = clamp(segment.startMs, 0, duration);
     const endMs = clamp(segment.endMs, 0, duration);
@@ -118,7 +239,7 @@ export function validateEditPlan(plan, durationMs, { requireVisualEvents = false
       if (!segments.some((segment) => segment.action !== "remove" && endMs > segment.startMs && startMs < segment.endMs)) throw new Error("B-roll 时间未落在保留片段");
       return { id: String(event.id || `broll-${index + 1}`), assetId, startMs: Math.round(startMs), endMs: Math.round(endMs), sourceStartMs: Math.round(sourceStartMs) };
     });
-    return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents, ...styledCaptions, captionCoverage: validateCaptionCoverage(visualEvents) };
+    return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents, ...styledCaptions, ...styleFields, layoutEvents, captionCoverage: validateCaptionCoverage(visualEvents) };
   }
   if (requireVisualEvents && rawVisualEvents.length < 3) throw new Error("剪辑计划必须包含可执行视觉事件");
   if (rawVisualEvents.length > 8) throw new Error("视觉事件不能超过 8 个");
@@ -150,7 +271,7 @@ export function validateEditPlan(plan, durationMs, { requireVisualEvents = false
     if (!segments.some((segment) => segment.action !== "remove" && endMs > segment.startMs && startMs < segment.endMs)) throw new Error("B-roll 时间未落在保留片段");
     return { id: event.id || `broll-${index + 1}`, assetId: asset.id, startMs: Math.round(startMs), endMs: Math.round(endMs), sourceStartMs: Math.round(sourceStartMs) };
   });
-  return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents, ...styledCaptions, captionCoverage: validateCaptionCoverage(visualEvents) };
+  return { version: 2, summary: String(plan.summary || ""), segments, shorts, visualEvents, brollEvents, ...styledCaptions, ...styleFields, layoutEvents, captionCoverage: validateCaptionCoverage(visualEvents) };
 }
 
 export function buildFallbackPlan(transcript, media, goal = "") {

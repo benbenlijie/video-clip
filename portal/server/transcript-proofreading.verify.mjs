@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { subtitlesMatchTranscript, validateProofreadResult } from "./transcript-proofreading.mjs";
+import * as proofreading from "./transcript-proofreading.mjs";
 
 const primary = {
   provider: "volcengine", language: "zh", durationMs: 3000, text: "把烦做的剪辑工具交给AI然后检查字幕",
@@ -74,6 +75,14 @@ assert.equal(subtitlesMatchTranscript("1\n00:00:01,500 --> 00:00:02,500\n你好\
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,400\n把繁琐的剪辑工具交给AI\n", accepted.transcript, { segments: [{ startMs: 100, endMs: 1400, action: "keep" }, { startMs: 1500, endMs: 2800, action: "remove" }] }), true, "subtitle text may omit removed footage");
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:00,650\n把繁琐\n", { ...accepted.transcript, segments: [{ ...accepted.transcript.segments[0], words: [{ startMs: 100, endMs: 300, text: "把" }, { startMs: 300, endMs: 650, text: "繁琐" }, { startMs: 650, endMs: 900, text: "的" }, { startMs: 900, endMs: 1000, text: "剪辑" }, { startMs: 1000, endMs: 1100, text: "工具" }, { startMs: 1100, endMs: 1200, text: "交给" }, { startMs: 1200, endMs: 1300, text: "AI" }] }, accepted.transcript.segments[1]] }, { segments: [{ startMs: 100, endMs: 650, action: "keep" }] }), true, "partial trims with word timestamps compare their retained words exactly");
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n把\n", accepted.transcript, { segments: [{ startMs: 100, endMs: 650, action: "keep" }] }), false, "a partial transcript segment without word timing cannot silently pass incomplete captions");
+assert.equal(typeof proofreading.findUnverifiablePartialTranscriptSegments, "function", "the subtitle validator must report corrected segments whose word timings no longer match");
+const correctedWithStaleWords = { text: "校对后的字幕", segments: [{ id: "corrected-segment", startMs: 100, endMs: 1400, text: "校对后的字幕", words: [{ startMs: 100, endMs: 1400, text: "旧识别文字" }] }] };
+assert.deepEqual(proofreading.findUnverifiablePartialTranscriptSegments(correctedWithStaleWords, { segments: [{ startMs: 300, endMs: 900, action: "keep" }] }), ["corrected-segment"]);
+assert.deepEqual(proofreading.findUnverifiablePartialTranscriptSegments(correctedWithStaleWords, { segments: [{ startMs: 100, endMs: 1400, action: "keep" }] }), [], "keeping the full corrected segment does not require word-level timing");
+assert.deepEqual(proofreading.findUnverifiablePartialTranscriptSegments(correctedWithStaleWords, { segments: [{ startMs: 100, endMs: 700, action: "keep" }, { startMs: 700, endMs: 1400, action: "keep" }] }), [], "adjacent cuts that retain the full segment do not invalidate it");
+const protectedWithLaterWords = { ...correctedWithStaleWords, segments: [{ ...correctedWithStaleWords.segments[0], words: [{ startMs: 100, endMs: 700, text: "校对" }, { startMs: 700, endMs: 1400, text: "后的字幕" }], wordTimingStatus: "protected" }] };
+assert.deepEqual(proofreading.findUnverifiablePartialTranscriptSegments(protectedWithLaterWords, { segments: [{ startMs: 100, endMs: 800, action: "keep" }] }), ["corrected-segment"], "protected segments stay all-or-nothing even if later timing happens to resemble the corrected text");
+assert.deepEqual(proofreading.findUnverifiablePartialTranscriptSegments(protectedWithLaterWords, { segments: [{ startMs: 100, endMs: 1400, action: "keep" }] }), [], "a fully retained protected segment passes the final alignment guard");
 
 const cutWithCaptionTail = { segments: [{ startMs: 0, endMs: 1000, action: "keep" }, { startMs: 2000, endMs: 3000, action: "keep" }] };
 const cutTailTranscript = { text: "你好世界", segments: [{ id: "hello", startMs: 0, endMs: 1000, text: "你好" }, { id: "world", startMs: 2000, endMs: 3000, text: "世界" }] };
@@ -89,10 +98,22 @@ const visuallyCaptionedTranscript = { text: "你好世界", segments: [
   { id: "world", startMs: 2000, endMs: 3000, text: "世界", words: [{ startMs: 2000, endMs: 2500, text: "世" }, { startMs: 2500, endMs: 3000, text: "界" }] },
 ] };
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, visualCoverage, ["<div>世界</div>"]), true, "exact spoken words shown by a timed visual event can cover omitted SRT text");
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, visualCoverage, ["<div>世界</div>"], [{ src: [0, 3000], out: [0, 3000] }]), true, "Wayne captions may validate visual coverage from the saved source without Remotion event records");
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, visualCoverage, ["<div>字幕</div>"]), false, "visual coverage must exist in the declared overlay source");
 const actualPieces = [{ src: [0, 1000], out: [0, 1000] }, { src: [3000, 4000], out: [1000, 2000] }];
 const actualTranscript = { text: "你好世界", segments: [{ id: "one", startMs: 100, endMs: 900, text: "你好" }, { id: "two", startMs: 3100, endMs: 3900, text: "世界" }] };
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:00,900\n你好\n\n2\n00:00:03,100 --> 00:00:03,900\n世界\n", actualTranscript, { segments: actualPieces.map((piece) => ({ startMs: piece.src[0], endMs: piece.src[1], action: "keep" })) }, [], actualPieces), false, "a composed two-second video must reject uncut source SRT timestamps");
+const contiguousPieceTranscript = {
+  text: "甲乙",
+  segments: [{ id: "piece-split", startMs: 100, endMs: 1900, text: "甲乙", words: [{ startMs: 100, endMs: 1000, text: "甲" }, { startMs: 1000, endMs: 1900, text: "乙" }] }],
+};
+const contiguousPieces = [{ src: [0, 1000], out: [0, 1000] }, { src: [1000, 2000], out: [1000, 2000] }];
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,900\n甲乙\n", contiguousPieceTranscript, { segments: contiguousPieces.map((piece) => ({ startMs: piece.src[0], endMs: piece.src[1], action: "keep" })) }, [], contiguousPieces), true, "a caption may cross contiguous timeline pieces such as a punch-in split");
+const fullyRetainedCorrectedSegment = {
+  text: "把繁琐的剪辑工作交给AI",
+  segments: [{ id: "corrected-full", startMs: 100, endMs: 1900, text: "把繁琐的剪辑工作交给AI", words: [{ startMs: 100, endMs: 900, text: "把烦做的剪辑工具" }, { startMs: 900, endMs: 1900, text: "交给AI" }] }],
+};
+assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,900\n把繁琐的剪辑工作交给AI\n", fullyRetainedCorrectedSegment, { segments: contiguousPieces.map((piece) => ({ startMs: piece.src[0], endMs: piece.src[1], action: "keep" })) }, [], contiguousPieces), true, "a fully retained corrected segment may use its approved text when old word tokens are stale");
 const coverageMap = [{ src: [0, 3000], out: [0, 3000] }];
 const wrongEventCoverage = { ...visualCoverage, visualEvents: [{ id: "other", startMs: 0, endMs: 300, type: "emphasis", text: "世界" }, { id: "wrong", startMs: 2000, endMs: 3000, type: "emphasis", text: "概述" }], captionCoverage: [{ eventId: "wrong", startMs: 2000, endMs: 3000, text: "世界" }] };
 assert.equal(subtitlesMatchTranscript("1\n00:00:00,100 --> 00:00:01,000\n你好\n", visuallyCaptionedTranscript, wrongEventCoverage, ["世界 概述"], coverageMap, [{ sourceEventId: "other", startMs: 0, endMs: 300, text: "世界" }, { sourceEventId: "wrong", startMs: 2000, endMs: 3000, text: "概述" }]), false, "a word displayed by another event cannot cover missing subtitles");

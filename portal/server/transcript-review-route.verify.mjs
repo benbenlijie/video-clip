@@ -22,7 +22,7 @@ const project = {
   id: "transcript-review-fixture", workflowId: "wayne-video-editing", status: "plan_ready", goal: "review transcript", style: "clean",
   createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), artifacts: [], comments: [], brollAssets: [],
   media: { filename: "input.mp4", path: "unused", durationMs: 3000, width: 720, height: 1280, hasAudio: true, hasVideo: true },
-  transcript: { provider: "volcengine", language: "zh", durationMs: 3000, text: "把繁琐的剪辑工具交给AI然后检查字幕", segments: [{ id: "segment-1", startMs: 100, endMs: 1400, text: "把繁琐的剪辑工具交给AI" }, { id: "segment-2", startMs: 1500, endMs: 2800, text: "然后检查字幕" }] },
+  transcript: { provider: "volcengine", language: "zh", durationMs: 3000, text: "把繁琐的剪辑工具交给AI然后检查字幕", segments: [{ id: "segment-1", startMs: 100, endMs: 1400, text: "把繁琐的剪辑工具交给AI", words: [{ startMs: 100, endMs: 1400, text: "把繁琐的剪辑工具交给AI" }] }, { id: "segment-2", startMs: 1500, endMs: 2800, text: "然后检查字幕", words: [{ startMs: 1500, endMs: 2200, text: "然后检查" }, { startMs: 2200, endMs: 2800, text: "字幕" }] }] },
   proofreading: { status: "needs_review", model: "small_q5_1", changes: [], unresolved: [{ segmentId: "segment-2", primaryText: "然后检查字幕", secondaryText: "然后检查字母", reason: "末字识别不同" }], previewTranscriptSha256: "previous-preview-hash", previewStale: false },
   plan: { segments: [{ startMs: 0, endMs: 3000, action: "keep" }] }, qc: { passed: true },
 };
@@ -71,7 +71,7 @@ try {
   assert.match((await unresolvedRender.json()).error, /字幕.*待确认/);
 
   const url = `${base}/api/projects/${project.id}/transcript`;
-  const editedSegments = project.transcript.segments.map((segment) => ({ ...segment, text: segment.id === "segment-2" ? "然后检查字幕。" : segment.text }));
+  const editedSegments = project.transcript.segments.map((segment) => ({ ...segment, text: segment.id === "segment-2" ? "然后确认字幕" : segment.text }));
   const rejected = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ segments: editedSegments, confirmedUnresolvedSegmentIds: [] }) });
   assert.equal(rejected.status, 400);
   assert.equal((await (await fetch(`${base}/api/projects/${project.id}`)).json()).transcript.segments[1].text, "然后检查字幕");
@@ -79,7 +79,11 @@ try {
   const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ segments: editedSegments, confirmedUnresolvedSegmentIds: ["segment-2"] }) });
   assert.equal(response.status, 200, await response.text());
   const updated = JSON.parse(await (await fetch(`${base}/api/projects/${project.id}`)).text());
-  assert.equal(updated.transcript.segments[1].text, "然后检查字幕。");
+  assert.equal(updated.transcript.segments[1].text, "然后确认字幕");
+  assert.equal(updated.transcript.segments[1].wordTimingStatus, "estimated", "manual text corrections must mark reconstructed word timings as estimates");
+  assert.equal(updated.transcript.segments[1].words.map((word) => word.text).join(""), "然后确认字幕", "corrected caption text must be covered by remapped word timings");
+  assert.ok(updated.transcript.segments[1].words.every((word) => word.startMs >= 1500 && word.endMs <= 2800 && word.endMs > word.startMs));
+  assert.deepEqual(updated.transcript.segments[0].words, project.transcript.segments[0].words, "unchanged transcript segments retain their word timestamps");
   assert.equal(updated.proofreading.status, "confirmed");
   assert.equal(updated.proofreading.previewStale, true);
   assert.equal(updated.proofreading.resolvedUnresolved[0].resolution, "user-corrected");
@@ -87,7 +91,7 @@ try {
   const stalePreviewRender = await fetch(renderUrl, { method: "POST" });
   assert.equal(stalePreviewRender.status, 409);
   assert.match((await stalePreviewRender.json()).error, /预览.*未更新/);
-  assert.match(await fs.readFile(path.join(projectDir, "transcript.srt"), "utf8"), /然后检查字幕。/);
+  assert.match(await fs.readFile(path.join(projectDir, "transcript.srt"), "utf8"), /然后确认字幕/);
   assert.deepEqual(await fs.readFile(path.join(projectDir, "transcript.original.json")), originalBytes);
   assert.equal(project.proofreading.previewTranscriptSha256, "previous-preview-hash");
 

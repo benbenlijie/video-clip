@@ -1,4 +1,5 @@
 import { transcriptToSrt } from "./edit-plan.mjs";
+import { normalizeTranscriptText, remapWordTimings } from "./transcript-word-timing.mjs";
 
 export function ensureTranscriptReviewState(project) {
   if (!project?.transcript) return false;
@@ -34,7 +35,18 @@ function validateSegments(input, source) {
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs <= startMs || endMs > Number(original.endMs) + 60000 || startMs < previousStart) throw new Error(`字幕片段时间戳无效: ${original.id}`);
     if (!text || text.length > 2000) throw new Error(`字幕片段文字不能为空或过长: ${original.id}`);
     previousStart = startMs;
-    return { ...original, text };
+    const updated = { ...original, text };
+    if (normalizeTranscriptText(text) !== normalizeTranscriptText(original.text)) {
+      const words = remapWordTimings({ previousText: original.text, nextText: text, words: original.words, startMs: original.startMs, endMs: original.endMs });
+      if (words) {
+        updated.words = words;
+        updated.wordTimingStatus = "estimated";
+      } else {
+        delete updated.words;
+        updated.wordTimingStatus = "protected";
+      }
+    }
+    return updated;
   });
 }
 

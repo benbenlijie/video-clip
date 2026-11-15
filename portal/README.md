@@ -65,6 +65,16 @@ VOLCENGINE_ASR_API_KEY=你的火山引擎 APP Key
 TENCENTCLOUD_SECRET_ID=你的腾讯云 SecretId
 TENCENTCLOUD_SECRET_KEY=你的腾讯云 SecretKey
 TENCENTCLOUD_REGION=ap-guangzhou
+
+# 参考视频风格迁移：默认关闭
+REFERENCE_STYLE_ENABLED=0
+# 开启后可选 admin、preview、single、multi
+REFERENCE_STYLE_STAGE=admin
+REFERENCE_STYLE_VISUAL_ANALYSIS=1
+REFERENCE_STYLE_AUDIO_ANALYSIS=1
+REFERENCE_ANALYSIS_MODEL=
+REFERENCE_ANALYSIS_TIMEOUT_MS=120000
+WAYNE_AUDIO_ANALYSIS_PYTHON=python3
 ```
 
 当前 API 默认运行在 `http://127.0.0.1:18787`，读取这些配置并显示配置状态。项目会持久化到 `portal/storage/<projectId>/project.json`，媒体和产物保存在同一项目目录。标准版转录会提交任务并轮询结果；未配置时 API 会返回 `needs_input`，不会伪造剪辑完成。视频剪辑使用本机 Claude Code CLI，以 `claude-opus-5-5` 固定模型运行，不自动降级；该 CLI 使用同一 Anthropic API Key 和可选的 `ANTHROPIC_BASE_URL`。
@@ -76,6 +86,112 @@ TENCENTCLOUD_REGION=ap-guangzhou
 剪辑阶段会在项目中加载 `agent-skills/video-edit/SKILL.md`。Opus 检查旋转、音轨、真实原片帧和逐词转录，自主决定是否需要 B-roll；需要时通过受限 MCP 搜索 Pexels/Pixabay、查看候选缩略图、自动下载最多 3 条素材，并把实际来源、许可信息、SHA-256 和插入时间写入工程。随后它编写字幕与剪辑脚本：新工程将 Remotion 动效合成到统一草剪，旧工程保留 HyperFrames 等原方式；用户直接提出修改后继续同一工程，确认后导出终稿并重新抽帧审查。短样例可以没有额外 Shorts、标题卡或 CTA。媒体工具遵循工作区路径校验和媒体格式限制；当前兼容模式不提供内核级断网或文件系统隔离，任意外部 URL、外域重定向和项目数据上传都不得调用。
 
 Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回真实视频帧供视觉审查。由于当前宿主不允许 Claude 沙箱内再创建 namespace，媒体工具临时采用直接执行兼容模式：清理环境变量并保留应用层工作区路径校验，但不提供内核级路径或网络隔离。Claude 不得主动读取工作区之外的文件、抓取外部 URL 或上传项目数据。每阶段模型费用限额为计划 `$4`、终稿 `$6`，Claude Code 会话硬上限为 30 分钟。产物保留原视频之外的版本化预览、终稿、SRT/ASS、源码、工具日志和 QC 报告。人工仍须完整观看交付视频；AI 抽帧报告不是最终验收。
+
+## 视频号素材下载（wx-video-download）
+
+`weixin.qq.com/sph/...` 这类视频号分享链接没有匿名可用的媒体地址：网页端只渲染封面和「扫码前往微信观看」的二维码，`finder-preview` 接口只返回标题/作者/互动数据、不含 media 字段，官方直链必须带微信登录态。本项目把这一步收敛成「技能 + 脚本 + MCP」：解析交给可配置的解析器，下载、命名、校验由本地执行。
+
+```bash
+# 只看元数据（标题、作者、发布时间、直链）
+python3 agent-skills/wx-video-download/scripts/wx_video_dl.py resolve "<分享链接>" --json
+# 解析 + 下载 + ffprobe/SHA-256 校验
+npm run wx-video -- download "<分享链接>" --out ~/Downloads/videos --meta ~/Downloads/videos/<名字>.json --json
+# 离线验证（本地假解析器 + 本地素材，不联网）
+npm run verify:wx-video
+```
+
+- 技能正文：`agent-skills/wx-video-download/SKILL.md`；解析器协议：`agent-skills/wx-video-download/references/resolver.md`
+- agent 运行时自动发现：`.agents/skills/wx-video-download`（指向上面目录的软链，DSH/Codex 会扫 `.agents/skills`）
+- MCP server：`server/wx-video-tools.mjs`，提供 `resolve_video` / `download_video` / `probe_video` / `list_videos`，默认只写工作区 `downloads/` 并记审计日志
+
+```json
+{ "mcpServers": { "wxvideo": { "command": "node", "args": ["server/wx-video-tools.mjs"] } } }
+```
+
+解析器默认是公共第三方服务，可用 `WX_VIDEO_RESOLVER` 换成自建、`WX_VIDEO_RESOLVER_TOKEN` 带鉴权、`WX_VIDEO_ALLOW_PUBLIC_RESOLVER=0` 强制禁用公共实例。只处理有权保存的公开内容：直播回放、图文和私享内容会明确失败，不会伪造文件或路径。
+
+### 门户内使用：参考视频直接贴链接
+
+参考风格面板的「参考视频」卡片里，勾选使用许可后会多出一行链接输入：
+
+1. 粘贴 `https://weixin.qq.com/sph/…`（或整段分享口令）→「用链接导入」；
+2. 服务端 `POST /api/wechat-video/resolve` 先取标题/作者/发布时间给界面确认；
+3. `POST /api/wechat-video/ingest` 把视频下载到 `storage/wechat-sources/<id>/` 并校验 SHA-256、分辨率、时长；
+4. `POST /api/reference-styles` 以 `{sourceId, mode, referenceUsageConfirmed, trimStartSeconds?}` 复用同一条分析流水线：复制成 `reference-styles/<id>/reference.mp4`，分析成功后自动删掉暂存视频。
+
+风格分析只接受 30–180 秒：超过 180 秒的参考视频会自动截取 180 秒（默认从开头，可用 `trimStartSeconds` 指定起点），裁剪范围以 `sourceTrim` 返回并显示在面板提示里；短于 30 秒直接返回 422。链接与直链域名都有白名单校验，下发到浏览器的响应里不会出现签名直链或服务端绝对路径。
+
+链接导入的端到端验证：`npm run verify:wechat`（本地假解析器 + 本地素材，不联网）。
+
+## 百度网盘下载（baidu-pan-download）
+
+`pan.baidu.com/s/...` 的分享可以直接下，不用装百度网盘客户端：网页接口会给出一个支持 Range 的 `dlink`，只要带对 Cookie、并把下载请求的 UA 换成 `pan.baidu.com`，多线程分片就能跑满带宽。真正麻烦的是三件小事——直链与 UA 绑定（浏览器 UA 稳定 403 `hitcode:119`）、`filemetas` 返回的 “md5” 其实是文件令牌、Chrome 的 v10 Cookie 要先用 `peanuts` 或系统钥匙串的密钥解出来。
+
+```bash
+# 环境 + 登录态（Cookie 从本机 Chrome/Chromium/Edge/Brave 解出，缓存在 ~/.cache/baidu-pan-download）
+npm run baidu-pan -- selfcheck --json
+# 先看有什么（递归、只看视频），再决定下哪些
+python3 agent-skills/baidu-pan-download/scripts/baidu_pan_dl.py list "<分享链接或 /网盘/路径>" --videos --json
+# 下载 + ffprobe 校验
+python3 agent-skills/baidu-pan-download/scripts/baidu_pan_dl.py download "<分享链接>" --videos --pick 5 --out ~/Downloads/videos --json
+# 离线验证（本地假 pan 服务 + 本地素材，不联网）
+npm run verify:baidu-pan
+```
+
+- 技能正文：`agent-skills/baidu-pan-download/SKILL.md`；接口与踩坑记录：`agent-skills/baidu-pan-download/references/api-notes.md`
+- agent 运行时自动发现：`.agents/skills/baidu-pan-download`（指向上面目录的软链，DSH/Codex 会扫 `.agents/skills`）
+- MCP server：`server/baidu-pan-tools.mjs`，提供 `baidu_pan_whoami` / `baidu_pan_list` / `baidu_pan_download` / `baidu_pan_probe`，默认只写工作区 `downloads/` 并记审计日志
+
+```json
+{ "mcpServers": { "baidu-pan": { "command": "node", "args": ["server/baidu-pan-tools.mjs"] } } }
+```
+
+登录态只在本机：脚本从浏览器 Cookie 库解密 `BDUSS` + `STOKEN`，任何情况下都不外发；也可用 `BAIDU_BDUSS` / `BAIDU_STOKEN` 或 `--cookie-file` 显式提供。别人的分享会先「转存」到自己的网盘再下载，会占配额，大文件先确认；只处理有权访问的内容，不绕过会员或付费限制。
+
+## 参考视频风格迁移
+
+功能默认关闭。只有同时配置以下开关后，配置接口和前端才会显示入口：
+
+```env
+REFERENCE_STYLE_ENABLED=1
+REFERENCE_STYLE_STAGE=admin
+```
+
+灰度阶段：
+
+- `admin`：内部上传、分析、生成和审批 StylePack，不允许应用到项目；
+- `preview`：允许单视频应用和 style proof，不允许正式导出或多素材；
+- `single`：允许单视频参考风格正式导出；
+- `multi`：额外开放多素材参考风格导出。
+
+服务端启动时解析开关，非法阶段失败关闭。所有参考相关 API 都会再次检查阶段，
+客户端隐藏按钮不是安全边界。`REFERENCE_STYLE_ENABLED=0` 时已有风格项目仍可
+查看产物，但不能再生成、应用或导出风格成片。
+StylePack 生成和审批只允许本机 loopback 管理员；远端请求只能读取已审批版本。
+
+StyleProject 渲染需要 `bwrap`，并只挂载系统运行库、Node、Remotion、选中的
+Chromium 和受控临时/输出目录；网络命名空间与主机隔离。风格 QC 需要
+Python 3 + OpenCV；可用 `WAYNE_FACE_DETECTOR_PYTHON` 指定解释器。
+Remotion Chromium 会自动发现，也可用 `REMOTION_BROWSER_EXECUTABLE` 固定路径。
+官方测试可使用 `WAYNE_STYLE_GENERATOR=fixture` 和独立 `WAYNE_STYLE_DIR`，
+生产不得启用 fixture。
+
+参考分析默认会在有 Anthropic Key 时抽取代表帧做视觉语义识别，并用本地
+NumPy 分析音轨 BPM/起音密度；可通过 `REFERENCE_STYLE_VISUAL_ANALYSIS=0`
+和 `REFERENCE_STYLE_AUDIO_ANALYSIS=0` 分别关闭。视觉模型不写回参考字幕或
+文案，音轨分析不会上传参考音频。
+
+默认 `WAYNE_STYLE_AGENT=claude-code`。此时参考视频会进入独立的 Claude Code
+工作区，加载 `agent-skills/reference-style` 和 `server/style-agent-tools.mjs`
+提供的 `style` MCP。Claude Code 通过工具完成 probe、切镜、代表帧查看、音频
+分析、ReferenceAnalysis、StyleProject 编辑、sandbox proof、proof 审片和
+StylePack 持久化；服务器仍负责契约校验、bwrap、alpha、哈希和审批边界。
+风格代理优先使用本机 Claude Code OAuth 登录，文件读写由 `style` MCP 限定在
+参考工作区和 `style-project/src`；不向模型开放任意宿主机文件读写。
+测试或兼容场景可显式设置 `WAYNE_STYLE_AGENT=direct` 使用旧的直接分析路径。
+
+完整架构、API、权利边界和发布门禁见
+[`docs/reference-style-transfer.md`](../docs/reference-style-transfer.md)。
 
 ## 当前真实能力
 
@@ -102,6 +218,15 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 - `POST /api/projects/:id/chat/messages`：把一条自然语言修改请求加入当前会话；请求立即返回，后台基于最新成功版本运行 Claude Code，并通过项目 SSE 推送 `chat_started`、`chat_completed` 或 `chat_failed`；
 - `POST /api/projects/:id/comments`：保存时间戳批注。
 - `POST /api/projects/:id/render`：继续同一个 Opus 5.5 剪辑工程，按批注生成终稿、短视频（适合时）和字幕，逐帧检查并修正。服务端独立检查真实审片帧、音视频流与同步、持续黑帧、白名单路径和导出分辨率；失败不会标记为 `completed`。
+- `POST /api/reference-styles?mode=single-video-v1|multi-asset-v1`：上传并分析参考视频；默认由 Claude Code `reference-style` skill + `style` MCP 处理，默认关闭，按灰度阶段返回 403/404；
+- `GET /api/reference-styles/:id`、`GET /api/reference-styles/:id/media`：读取参考分析和支持 Range 的代表视频；
+- `POST /api/reference-styles/:id/generate`：内部管理阶段调用 Claude 生成受控 Remotion StyleProject；
+- `GET /api/style-packs`、`GET /api/style-packs/:id/:version`、`POST /api/style-packs/:id/:version/approve`、`POST /api/style-packs/:id/:version/reject`：读取版本化 StylePack、审批或拒绝；
+- `POST /api/projects/:id/apply-style`、`POST /api/projects/:id/style-preview`：应用风格结构并生成 3 秒 style proof；保存/预览阶段不会开放正式导出。
+
+同一个已审批 StylePack 可被任意数量项目复用。`apply-style` 允许在剪辑计划生成
+之前调用，此时只绑定风格资产；转录、计划或对话修改生成新版本后，服务端会重新
+计算项目级 application，不会复用上一条素材的时间码或文案。
 - `POST /api/projects/:id/render/remotion-preview`：可选生成 Remotion ProRes 4444 alpha overlay 和 FFmpeg 合成对照预览；检查 alpha、画面尺寸、音视频同步和黑帧，仅供旧工程兼容，主界面不再提供独立对照操作；
 - `GET /api/projects/:id/artifacts/:name`：下载项目白名单产物。
 
@@ -144,6 +269,49 @@ Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回
 
 项目验证新增 `node server/timeline-contract.verify.mjs` 和 `node server/engine-adapters.verify.mjs`；运行 `npm run verify:remotion` 可额外检查真实 Remotion alpha 渲染、FFmpeg 合成预览和 API 产物写入。
 
+参考风格测试使用 `npm run verify:style`，覆盖 ReferenceAnalysis、StyleProject、
+版本化 StylePack、静态策略、Claude 生成器、透明层沙箱、单/多素材应用、API、
+UI 状态、灰度开关、Style QC、工作区注入和真实渲染。`npm run verify` 已串联
+该套测试。
+真实黄金样本完成后，可用
+`node server/style-golden-report.mjs <private-labels.json> --output <private-report.json>`
+生成发布门禁报告；未达到阈值时返回码为 `2`。
+
 ### 统一审核工作台
 
 用户只需上传、等待、在一个页面看当前视频并提出修改、确认导出。版本选择仅包括真正生成的草剪和成片；历史对照文件不参与最新版本计算。字幕有疑问时提示核对，未保存文字和过期预览会阻止导出。后台制作失败时，上一版仍可播放；制作细节、历史批注及工程下载默认折叠。Remotion 本地渲染不新增云 API 请求；原有 Claude/ASR 费用和预算保持不变。
+
+## 口播剪辑评价（talking-head-edit-review）
+
+这是一套项目专属的“Skill + MCP”。它只评价剪辑形式：节奏与镜头组织、视觉支撑、字幕与图形、声音剪辑、连续性、技术质量和观看负荷；不评价人物吸引力、讲话内容、事实正确性或播放量。
+
+- Skill：`agent-skills/talking-head-edit-review/SKILL.md`；详细量表在 `references/rubric.md`
+- 运行时可发现路径：`.agents/skills/talking-head-edit-review`（指向上面的项目目录）
+- MCP server：`server/edit-review-tools.mjs`
+- 输出目录：工作区 `.edit-review/`，包含分析 JSON、抽帧、对比结果和 Markdown 报告；已加入 `.gitignore`
+
+MCP 提供：
+
+- `analyze_edit`：测量单条视频的切点、镜头时长、运动、静音、响度、峰值、黑帧、静态段和流级音画偏差；
+- `compare_edits`：两条视频的分析和指标差值；
+- `extract_contact_sheet`：返回全片代表帧接触表；
+- `view_frame`：返回精确时间点的证据帧；
+- `write_review_report`：写入六维 0-4 分、证据时间点、硬伤扣分和加权报告。
+
+```json
+{
+  "mcpServers": {
+    "editreview": {
+      "command": "node",
+      "args": ["server/edit-review-tools.mjs", "/absolute/path/to/video-workspace"]
+    }
+  }
+}
+```
+
+```bash
+# 离线合成视频验证：切点、音频、抽帧、对比和报告
+npm run verify:edit-review
+```
+
+自动指标不识别字幕语义、B-roll 是否有信息增量或构图好坏；Skill 会要求 Agent 查看接触表和证据帧后再评分。没有真实画面证据时，不应把数值包装成“剪辑质量结论”。

@@ -3,9 +3,15 @@ portal/.env
 portal/.env.*
 !portal/.env.example
 portal/storage/
+portal/style-library/
+portal/styles/
 portal/dist/
 portal/node_modules/
 portal/remotion-runtime/node_modules/
+portal/test-fixtures/style/golden/labels.local.json
+portal/test-fixtures/style/golden/*.local.*
+__pycache__/
+*.py[cod]
 
 # Other local/build output
 openchatcut-src/node_modules/
@@ -15,6 +21,7 @@ openchatcut-src/dist/
 .playwright-mcp/
 .spec-workflow/
 .research/
+.edit-review/
 
 # OS/editor files
 .DS_Store
@@ -24,3 +31,4 @@ openchatcut-src/dist/
 # Generated Vite config declarations
 portal/vite.config.d.ts
 portal/vite.config.js
+.gstack/

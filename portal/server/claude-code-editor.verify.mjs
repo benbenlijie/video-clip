@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildEditorPrompt, EDITOR_SESSION_TIMEOUT_MS, prepareWorkspace } from "./claude-code-editor.mjs";
@@ -16,8 +16,16 @@ assert.match(prompt, /portrait 9:16/);
 assert.match(prompt, /transcript-proofread\.json/);
 assert.match(prompt, /cannot directly hear the audio/);
 assert.match(prompt, /captionCoverage/);
+assert.match(prompt, /wordTimingStatus=estimated/);
+assert.match(prompt, /If wordTimingStatus=protected/);
+assert.match(prompt, /does not need to provide extra instructions/);
+assert.match(prompt, /never split a word, complete noun/);
 assert.match(buildEditorPrompt("plan", "remotion-main.v1"), /compose_remotion_video/);
 assert.doesNotMatch(buildEditorPrompt("plan", "remotion-main.v1"), /use mcp__video__render_remotion_preview/);
+assert.match(buildEditorPrompt("plan", "remotion-main.v1", { hasStylePack: true }), /style-transfer\.json/);
+assert.match(buildEditorPrompt("plan", "remotion-main.v1", { hasStylePack: true }), /reusable approved StylePack/);
+assert.match(buildEditorPrompt("plan", "remotion-main.v1", { hasStylePack: true }), /never use technical placeholders/);
+assert.match(buildEditorPrompt("plan", "remotion-main.v1", { hasStylePack: true }), /content-copy\.json/);
 
 const root = await mkdtemp(join(tmpdir(), "wayne-editor-"));
 try {
@@ -42,6 +50,44 @@ try {
   assert.equal(JSON.parse(await readFile(join(dir, "brief.json"), "utf8")).compositionMode, "remotion-main.v1");
   assert.match(await readFile(join(dir, ".claude/skills/video-edit/references/editorial-grammar.md"), "utf8"), /BROLL_COVER/);
   assert.match(await readFile(join(dir, ".claude/skills/video-edit/SKILL.md"), "utf8"), /HyperFrames 不是可选装饰/);
+  const styleProjectPath = join(root, "approved-style-project");
+  await mkdir(styleProjectPath, { recursive: true });
+  await writeFile(join(styleProjectPath, "StyleOverlay.tsx"), "export const reusable = true;\n");
+  project.stylePack = {
+    contract: "style-pack.v1",
+    id: "style-reuse-test",
+    version: 1,
+    status: "approved",
+    manifest: {
+      id: "style-reuse-test",
+      version: 1,
+      name: "Reusable captions",
+      parameters: { captionScale: 1.2 },
+      styleSpec: { contract: "style-spec.v2", captions: { maxCharsPerCue: 8 } },
+      sourceAnalysisId: "analysis-reuse-test",
+    },
+    manifestSha256: "a".repeat(64),
+  };
+  project.stylePackId = "style-reuse-test";
+  project.styleVersion = 1;
+  project.styleProjectPath = styleProjectPath;
+  project.referenceAnalysis = { contract: "reference-analysis.v2", analysisId: "analysis-reuse-test", styleSpec: project.stylePack.manifest.styleSpec };
+  project.styleApplication = {
+    parameters: { copyCaptions: true, copyLayout: true },
+    captionPolicy: { wordsPerCue: 8 },
+    warnings: [],
+    unsupported: [],
+  };
+  project.styleParameters = { captionScale: 1.2 };
+  project.styleCopy = { copyCaptions: true, copyLayout: true };
+  await prepareWorkspace(project, "chat-edit", { refreshSkill: true });
+  const reusableBrief = JSON.parse(await readFile(join(dir, "brief.json"), "utf8"));
+  assert.equal(reusableBrief.styleTransferPath, "style-transfer.json");
+  const reusableTransfer = JSON.parse(await readFile(join(dir, "style-transfer.json"), "utf8"));
+  assert.equal(reusableTransfer.contract, "style-transfer-brief.v1");
+  assert.equal(reusableTransfer.stylePackId, "style-reuse-test");
+  assert.equal(reusableTransfer.rules.doNotReuseReferenceTranscript, true);
+  assert.equal(reusableTransfer.styleSpec.captions.maxCharsPerCue, 8);
   console.log("claude-code-editor.verify: skill paths, prompt contract, and refresh behavior passed");
 } finally {
   await rm(root, { recursive: true, force: true });

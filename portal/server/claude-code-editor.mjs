@@ -6,10 +6,11 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { probeOutput, detectBlackFrames } from "./render.mjs";
 import { transcriptToSrt, validateEditPlan } from "./edit-plan.mjs";
-import { subtitlesMatchTranscript, transcriptFingerprint, validateProofreadResult } from "./transcript-proofreading.mjs";
+import { findUnverifiablePartialTranscriptSegments, subtitlesMatchTranscript, transcriptFingerprint, validateProofreadResult } from "./transcript-proofreading.mjs";
 import { workspacePath } from "./video-agent-tools.mjs";
 import { REMOTION_MAIN_MODE, validateRemotionComposition } from "./remotion-main.mjs";
 import { mainArtifactVersion } from "./edit-chat.mjs";
+import { hashStyleProject } from "./style-project.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const EDITABLE_SOURCE_EXTENSIONS = new Set([".py", ".mjs", ".js", ".css", ".html", ".json", ".ass", ".srt", ".md", ".txt", ".filter", ".log"]);
@@ -76,6 +77,50 @@ export async function prepareWorkspace(project, phase, options = {}) {
     }
     await fs.writeFile(join(dir, "assets.json"), JSON.stringify({ broll: assets, music: project.music ? { path: `music${extname(project.music.path)}`, licenseConfirmed: project.music.licenseConfirmed } : null }, null, 2));
   }
+  let styleBrief = {};
+  if (project.styleProjectPath || project.stylePackId) {
+    const stylePack = project.stylePack;
+    if (!stylePack || stylePack.status !== "approved" || !project.styleProjectPath) throw new Error("当前风格缺少已审批的 StylePack 或 StyleProject");
+    if (stylePack.id !== project.stylePackId || Number(stylePack.version) !== Number(project.styleVersion)) throw new Error("项目风格版本与已审批 StylePack 不一致");
+    const styleProjectHash = await hashStyleProject(project.styleProjectPath);
+    if (stylePack.codeSha256 && styleProjectHash !== stylePack.codeSha256) throw new Error("StyleProject 内容哈希已变化，请重新审批风格包");
+    const styleProjectDir = join(dir, "style-project");
+    await fs.rm(styleProjectDir, { recursive: true, force: true });
+    await fs.cp(project.styleProjectPath, styleProjectDir, { recursive: true, errorOnExist: true, force: false });
+    if (project.referenceAnalysis) await fs.writeFile(join(dir, "reference-analysis.json"), JSON.stringify(project.referenceAnalysis, null, 2));
+    styleBrief = {
+      stylePackId: stylePack.id,
+      styleVersion: Number(stylePack.version),
+      styleProjectDir: "style-project",
+      styleProjectHash,
+      styleManifestSha256: stylePack.manifestSha256,
+      styleCompositionId: "ReferenceStyle",
+      styleParameters: project.styleParameters || stylePack.manifest?.parameters || {},
+      styleCopy: project.styleCopy || undefined,
+      styleApplication: project.styleApplication || undefined,
+      referenceAnalysisPath: project.referenceAnalysis ? "reference-analysis.json" : undefined,
+    };
+    const styleTransfer = {
+      contract: "style-transfer-brief.v1",
+      stylePackId: stylePack.id,
+      styleVersion: Number(stylePack.version),
+      styleManifestSha256: stylePack.manifestSha256,
+      styleProjectHash,
+      sourceAnalysisId: stylePack.manifest?.sourceAnalysisId || null,
+      styleSpec: stylePack.manifest?.styleSpec || project.referenceAnalysis?.styleSpec || null,
+      styleParameters: project.styleParameters || stylePack.manifest?.parameters || {},
+      styleCopy: project.styleCopy || null,
+      application: project.styleApplication || null,
+      rules: {
+        preserveUserTranscript: true,
+        preserveUserMedia: true,
+        doNotReuseReferenceMedia: true,
+        doNotReuseReferenceTranscript: true,
+      },
+    };
+    await fs.writeFile(join(dir, "style-transfer.json"), JSON.stringify(styleTransfer, null, 2));
+    styleBrief.styleTransferPath = "style-transfer.json";
+  }
   const originalCache = await fs.readFile(join(projectDir, "transcript.original.json"), "utf8").catch(() => "");
   let originalTranscript = project.transcript;
   if (originalCache) {
@@ -85,7 +130,7 @@ export async function prepareWorkspace(project, phase, options = {}) {
   await fs.writeFile(join(dir, "transcript.original.json"), JSON.stringify(originalTranscript, null, 2));
   if (project.secondaryTranscript) await fs.writeFile(join(dir, "transcript.whisper.json"), JSON.stringify(project.secondaryTranscript, null, 2));
   if (project.proofreading) await fs.writeFile(join(dir, "transcript-proofread.json"), JSON.stringify(project.proofreading, null, 2));
-  await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, compositionMode: project.compositionMode, approvedCompositionDesignSha256: project.editor?.compositionDesignSha256, projectId: project.id, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: ["render", "chat-edit"].includes(phase) ? project.plan : undefined, chatTurn: options.chatTurn ? { ...options.chatTurn, timeline: "edited-preview", instruction: "The requested time range belongs to this baseVersion preview, not the uncut input.mp4. Use the saved timeline map to locate source footage." } : undefined, chatContext: options.chatContext || undefined, latestVersion: project.editSession?.latestVersion || project.editor?.version || 1 }, null, 2));
+  await fs.writeFile(join(dir, "brief.json"), JSON.stringify({ phase, compositionMode: project.compositionMode, approvedCompositionDesignSha256: project.editor?.compositionDesignSha256, projectId: project.id, goal: project.goal, style: project.style, comments: project.comments || [], media: { ...project.media, path: "input.mp4" }, approvedPlan: ["render", "chat-edit"].includes(phase) ? project.plan : undefined, chatTurn: options.chatTurn ? { ...options.chatTurn, timeline: "edited-preview", instruction: "The requested time range belongs to this baseVersion preview, not the uncut input.mp4. Use the saved timeline map to locate source footage." } : undefined, chatContext: options.chatContext || undefined, latestVersion: project.editSession?.latestVersion || project.editor?.version || 1, ...styleBrief }, null, 2));
   return { dir, runId };
 }
 
@@ -97,7 +142,7 @@ export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetU
   const toolEnv = { PATH: process.env.PATH, HOME: process.env.HOME || "/home/ben", PEXELS_API_KEY: process.env.PEXELS_API_KEY || "", PIXABAY_API_KEY: process.env.PIXABAY_API_KEY || "" };
   await fs.writeFile(configPath, JSON.stringify({ mcpServers: { video: { command: process.execPath, args: [join(root, "server/video-agent-tools.mjs"), dir, auditPath], env: toolEnv } } }));
   const brief = JSON.parse(await fs.readFile(join(dir, "brief.json"), "utf8"));
-  const prompt = buildEditorPrompt(phase, brief.compositionMode);
+  const prompt = buildEditorPrompt(phase, brief.compositionMode, { hasStylePack: Boolean(brief.stylePackId) });
   const args = ["--bare", "--restricted", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", configPath, "--model", EDITOR_MODEL, "--effort", "high", "--permission-mode", "dontAsk", "--tools", "Read,Skill", "--allowedTools", "Read,Skill,mcp__video__*", "--max-budget-usd", String(budgetUsd)];
   if (resume && sessionId) args.push("--resume", sessionId);
   else if (sessionId) args.push("--session-id", sessionId);
@@ -134,7 +179,7 @@ export async function invokeClaudeCode({ dir, phase, onEvent = () => {}, budgetU
   return receipt;
 }
 
-export function buildEditorPrompt(phase, compositionMode = null) {
+export function buildEditorPrompt(phase, compositionMode = null, { hasStylePack = false } = {}) {
   const mainWorkflow = compositionMode === REMOTION_MAIN_MODE;
   const animationInstruction = mainWorkflow
     ? "Use the installed Remotion skill for standard title_card, emphasis, and cta events. Make a clean base video with the actual cuts, B-roll and audio, but without burned captions or duplicate title overlays. Write timeline.json with frame-aligned pieces, each containing src:[sourceStartMs,sourceEndMs] and out:[editedStartMs,editedEndMs], in milliseconds, matching the executed edit-plan.json and the actual base video fps. Adjust subtitle presentation through edit-plan.json.captionStyle (fontSize 8-64, marginV 0-160, outline 0-5, color #RRGGBB), including when the user asks for larger captions. Call mcp__video__compose_remotion_video with baseVideo and this phase. It renders Remotion on the edited timeline, burns captions.srt, and retains reproducible alpha/source/hash evidence. Inspect the returned outputPath at all visual events and B-roll points, then use that exact path as manifest.main and set manifest.compositionMode to remotion-main.v1. Render full source dimensions during the final render phase, with the same approved edit-plan.json, captions.srt and timeline.json as the preview. Do not call render_remotion_preview or require HyperFrames. If the main composition fails, report failure and keep the existing version; never silently omit the planned animation."
@@ -145,7 +190,11 @@ export function buildEditorPrompt(phase, compositionMode = null) {
   const proofreadingInstruction = phase === "plan"
     ? "Before finalizing the plan, read transcript.original.json and transcript.whisper.json if present. Claude Code cannot directly hear the audio, so compare the two ASR texts only; do not claim to have listened. Correct a segment only when the replacement is supported by one or both transcript sources. Write transcript-proofread.json with status ready, needs_review, or manual_review_required; include corrected transcript segments, every text change with evidence (primary, whisper, or both) and reason, and every unresolved disagreement with the exact primary/Whisper text. Keep ids and source timestamps unchanged. Never invent words from context. Update transcript.json to the corrected transcript. If Whisper is missing, keep the primary text unchanged and set manual_review_required. Continue with the edit plan in this same Claude session; do not start another Claude session for proofreading."
     : "Use the current transcript.json as the authoritative approved text. Do not alter spoken words unless the user requests a transcript correction.";
-  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, transcript.json, transcript.original.json, transcript.whisper.json if present, and assets.json. ${proofreadingInstruction} Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Keep subtitle wording complete: if the same spoken words are visibly presented by a timed visual overlay and therefore omitted from captions.srt, declare each exact source interval and verbatim text in edit-plan.json.captionCoverage with its visualEvent id; do not mark paraphrases or merely implied text as covered. The covered words must exist in the actually rendered event input or declared HTML/JS visual source, and be verified in the main preview. Implement the edit yourself; do not just describe a plan. ${animationInstruction} Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. ${remotionInstruction} End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
+  const timingInstruction = "When the user has manually corrected a transcript segment, the server has already compared the old and new text and remapped unchanged/replaced/inserted grapheme timing where possible; wordTimingStatus=estimated denotes ASR-anchored estimates, not fresh audio evidence. If wordTimingStatus=protected, write edit-plan.json as a separate step before rendering: the MCP server automatically expands any partial cut to retain that complete utterance, while a complete-sentence deletion remains allowed. After any execute call that reports automatic plan protection, reread edit-plan.json and rerender every output made by that same command before reviewing or publishing it. The user does not need to provide extra instructions for this. Caption cue boundaries must follow semantic phrases and punctuation; never split a word, complete noun, proper noun or fixed phrase, and never start a Chinese cue with a binding particle such as 的/地/得/了/着/过/和/与/及/或/而/但/却/并/且.";
+  const styleInstruction = hasStylePack
+    ? "A reusable approved StylePack is attached. Read style-transfer.json and the copied style-project/style-manifest.json before planning. Treat it as the visual grammar contract for title, identity, captions, panels, keyword emphasis, enter/exit motion and layout. Preserve the user's transcript and media; never copy reference transcript, text, footage, audio, people or brand. Before edit-plan.json, write content-copy.json with content-specific title, subtitle, identity, identitySubtext and cta plus evidence from the current user's transcript, real frames, filename or brief; include content-copy.json in manifest.sources. Omit identity when evidence is absent and never use technical placeholders such as style proof, user title, user identity or six-second preview as production copy. The server will reapply the StylePack to the final plan for provenance, so do not invent a competing visual style."
+    : "No reusable StylePack is attached. Use the project's normal video-edit design rules.";
+  return `/video-edit\nUse this skill for the ${phase} phase. Start by reading .claude/skills/video-edit/SKILL.md with mcp__video__read_file. The project references are inside that skill directory: read .claude/skills/video-edit/references/public-skill-audit.md, .claude/skills/video-edit/references/editorial-grammar.md, and .claude/skills/video-edit/references/verification.md. Then read brief.json, style-transfer.json if present, transcript.json, transcript.original.json, transcript.whisper.json if present, and assets.json. ${styleInstruction} ${proofreadingInstruction} Use the project adapter rules, not a generic downloaded skill. You must operate the actual tools and visually inspect real video frames. Keep subtitle wording complete: if the same spoken words are visibly presented by a timed visual overlay and therefore omitted from captions.srt, declare each exact source interval and verbatim text in edit-plan.json.captionCoverage with its visualEvent id; do not mark paraphrases or merely implied text as covered. The covered words must exist in the actually rendered event input or declared HTML/JS visual source, and be verified in the main preview. ${timingInstruction} Implement the edit yourself; do not just describe a plan. ${animationInstruction} Run .claude/skills/video-edit/scripts/verify-render.mjs on the preview or final when applicable. For portrait 9:16 talking-head footage, do not default to a talking-head-only edit: evaluate at least one licensed B-roll search for each concrete visual intent, and use 1–3 B-roll inserts when the visual adds information; absence of product UI is not a reason to skip generic but relevant scene-setting footage. Keep title/emphasis cards short, compact and inside the portrait safe area; prefer split-screen, B-roll cover, punch-in, kinetic phrase captions and motion accents over large persistent text panels. When style-transfer.json is present, its StyleSpec v2 geometry and motion contract take precedence over these generic style examples. ${remotionInstruction} End only after writing manifest.json with phase=${phase}, actual output paths and honest visual review. Keep work bounded: at most two repair cycles and no unrelated exploration. ${phase === "render" ? "An approved preview and editable sources already exist in this workspace. Read them and apply the user's timestamped feedback." : phase === "chat-edit" ? "This is a continuation turn. Read the latest approved version and the chat turn in brief.json. Apply only the user's latest request, preserve unrelated decisions, generate a new low-resolution preview, and leave the prior version intact." : "Produce a complete low-resolution edited preview and editable sources for approval, not a final delivery."}`;
 }
 
 export async function validateAgentOutput(dir, phase, { compositionMode, approvedDesignSha256 = null, targetMedia = null } = {}) {
@@ -196,7 +245,9 @@ export async function validateAgentOutput(dir, phase, { compositionMode, approve
     for (const source of manifest.sources.filter((item) => [".html", ".js"].includes(extname(item).toLowerCase()))) {
       visualSourceTexts.push(await fs.readFile(await workspacePath(dir, source), "utf8"));
     }
-    if (!subtitlesMatchTranscript(subtitleText, transcript, editPlan, visualSourceTexts, composition?.record.pieces, composition?.record.events)) throw new Error("字幕文字与当前校对转录不一致");
+    const unalignedSegments = findUnverifiablePartialTranscriptSegments(transcript, editPlan, composition?.record.pieces);
+    if (unalignedSegments.length) throw new Error(`字幕无法校验：剪辑切入了逐词时间码与校对文字不一致的片段（${unalignedSegments.join(", ")}）。请保留完整片段，或先重新对齐逐词时间码再重试。`);
+    if (!subtitlesMatchTranscript(subtitleText, transcript, editPlan, visualSourceTexts, composition?.record.pieces, composition?.record.events)) throw new Error("字幕文字与当前校对转录不一致，或字幕时间码与当前剪辑时间轴不一致");
   }
   const files = [{ path: manifest.main, kind: ["plan", "chat-edit"].includes(phase) ? "preview" : "video", ...probe }, ...(subtitle ? [{ path: manifest.subtitle, kind: "subtitle" }] : [])];
   if (composition) files.push(...composition.files);

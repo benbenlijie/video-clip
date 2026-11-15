@@ -14,7 +14,13 @@
         "workflowMode": { "const": "multi-asset-v1" },
         "goal": { "type": "string" },
         "style": { "type": "string" },
-        "version": { "type": "integer", "minimum": 1 }
+        "version": { "type": "integer", "minimum": 1 },
+        "stylePackId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,80}$" },
+        "styleVersion": { "type": "integer", "minimum": 1 },
+        "styleParameters": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        }
       },
       "additionalProperties": false
     },
@@ -116,7 +122,17 @@
           "track": { "enum": ["video-main", "video-overlay"] },
           "purpose": { "type": "string" },
           "reason": { "type": "string" },
-          "audioPolicy": { "type": "string" }
+          "audioPolicy": { "type": "string" },
+          "shotRole": { "enum": ["full", "punch_in", "split", "broll_cover", "unknown"] },
+          "layout": {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": { "enum": ["full", "punch_in", "split", "broll_cover", "unknown"] },
+              "params": { "type": "object" }
+            },
+            "additionalProperties": false
+          }
         },
         "additionalProperties": false
       }

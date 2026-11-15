@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/reference-analysis.v1.schema.json",
+  "title": "ReferenceAnalysis.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "analysisId", "source", "shots", "rhythm", "captions", "overlays", "audio", "capabilities", "unsupported", "confidence"],
+  "properties": {
+    "contract": { "const": "reference-analysis.v1" },
+    "analysisId": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "durationMs", "width", "height", "aspectRatio", "fps", "hasAudio", "sha256"],
+      "properties": {
+        "filename": { "type": "string", "minLength": 1 },
+        "durationMs": { "type": "integer", "minimum": 30000, "maximum": 180000 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "aspectRatio": { "enum": ["9:16", "16:9"] },
+        "fps": { "type": "number", "exclusiveMinimum": 0, "maximum": 120 },
+        "hasAudio": { "type": "boolean" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "startMs", "endMs", "role", "layout", "broll"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "startMs": { "type": "integer", "minimum": 0 },
+          "endMs": { "type": "integer", "minimum": 1 },
+          "role": { "enum": ["hook", "teaser", "context", "proof", "payoff", "brand", "cta", "unknown"] },
+          "layout": { "enum": ["full", "punch_in", "split", "broll_cover", "unknown"] },
+          "broll": { "type": "boolean" }
+        }
+      }
+    },
+    "rhythm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hookMs", "avgShotMs", "cutsPerMinute", "punchInRatio", "brollRatio"],
+      "properties": {
+        "hookMs": { "type": "integer", "minimum": 0 },
+        "avgShotMs": { "type": "number", "minimum": 0 },
+        "cutsPerMinute": { "type": "number", "minimum": 0 },
+        "punchInRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "brollRatio": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "captions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grouping", "maxWordsPerCue", "position", "fontSizeRatio", "primaryColor", "strokeColor", "strokeWidth", "keywordColor", "animation"],
+      "properties": {
+        "grouping": { "enum": ["phrase", "sentence", "word", "unknown"] },
+        "maxWordsPerCue": { "type": "integer", "minimum": 0, "maximum": 12 },
+        "position": { "enum": ["bottom", "middle", "top", "unknown"] },
+        "fontSizeRatio": { "type": "number", "minimum": 0, "maximum": 0.2 },
+        "primaryColor": { "type": "string", "pattern": "^#[0-9a-f]{6}$" },
+        "strokeColor": { "type": "string", "pattern": "^#[0-9a-f]{6}$" },
+        "strokeWidth": { "type": "number", "minimum": 0, "maximum": 12 },
+        "keywordColor": { "type": "string", "pattern": "^#[0-9a-f]{6}$" },
+        "animation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "overlays": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bpm", "voice", "sfxDensity"],
+      "properties": {
+        "bpm": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "voice": { "enum": ["human", "synthetic", "mixed", "unknown"] },
+        "sfxDensity": { "enum": ["none", "low", "medium", "high", "unknown"] }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["needsBroll", "needsScreenshots", "needsSplitScreen"],
+      "properties": {
+        "needsBroll": { "type": "boolean" },
+        "needsScreenshots": { "type": "boolean" },
+        "needsSplitScreen": { "type": "boolean" }
+      }
+    },
+    "unsupported": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall", "rhythm", "captions", "layout"],
+      "properties": {
+        "overall": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rhythm": { "type": "number", "minimum": 0, "maximum": 1 },
+        "captions": { "type": "number", "minimum": 0, "maximum": 1 },
+        "layout": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

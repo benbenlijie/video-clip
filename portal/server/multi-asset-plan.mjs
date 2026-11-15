@@ -3,6 +3,9 @@ import { assertMultiAssetReady } from "./multi-asset.mjs";
 import { buildAssetInventory } from "./multi-asset-analysis.mjs";
 import { promises as fs } from "node:fs";
 import { resolve, sep } from "node:path";
+import { normalizeCaptionStyle } from "./edit-plan.mjs";
+
+const LAYOUT_TYPES = new Set(["full", "punch_in", "split", "broll_cover", "unknown"]);
 
 function extractJson(value) {
   const fenced = String(value || "").match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
@@ -24,7 +27,7 @@ function normalizeClip(clip, index, assetsById) {
   if (timelineStartMs < 0 || timelineEndMs <= timelineStartMs || timelineEndMs - timelineStartMs !== sourceOutMs - sourceInMs) throw new Error(`剪辑方案时间轴区间无效: ${id}`);
   const track = String(clip.track || "video-main");
   if (!["video-main", "video-overlay"].includes(track)) throw new Error(`首版不支持此剪辑轨道: ${track}`);
-  return {
+  const result = {
     id,
     sourceAssetId,
     sourceInMs: Math.round(sourceInMs),
@@ -35,6 +38,17 @@ function normalizeClip(clip, index, assetsById) {
     purpose: String(clip.purpose || "content").slice(0, 80),
     reason: String(clip.reason || "").slice(0, 500),
   };
+  if (clip.shotRole != null) {
+    const shotRole = String(clip.shotRole);
+    if (!LAYOUT_TYPES.has(shotRole)) throw new Error(`剪辑方案镜头角色无效: ${id}`);
+    result.shotRole = shotRole;
+  }
+  if (clip.layout != null) {
+    if (typeof clip.layout !== "object" || Array.isArray(clip.layout) || !LAYOUT_TYPES.has(String(clip.layout.type))) throw new Error(`剪辑方案布局无效: ${id}`);
+    if (clip.layout.params != null && (typeof clip.layout.params !== "object" || Array.isArray(clip.layout.params))) throw new Error(`剪辑方案布局参数无效: ${id}`);
+    result.layout = { type: String(clip.layout.type), params: clip.layout.params ? { ...clip.layout.params } : {} };
+  }
+  return result;
 }
 
 function inputFingerprint(project) {
@@ -84,6 +98,25 @@ export function validateMultiAssetPlan(rawPlan, project) {
   const durationDeltaRatio = target ? Math.abs(durationMs - target) / target : 0;
   const warnings = target && durationDeltaRatio > 0.1 ? [{ code: "duration-target-exceeded", targetDurationMs: target, plannedDurationMs: durationMs, deltaRatio: durationDeltaRatio }] : [];
   const latestVersion = Math.max(0, Number(project.multiAssetPlan?.version) || 0, ...(project.multiAssetPlanHistory || []).map((item) => Number(item.version) || 0));
+  const styleFields = {};
+  if (rawPlan.stylePackId != null) {
+    const stylePackId = String(rawPlan.stylePackId);
+    if (!/^[a-z0-9][a-z0-9-]{2,80}$/.test(stylePackId)) throw new Error("多素材方案 stylePackId 无效");
+    styleFields.stylePackId = stylePackId;
+  }
+  if (rawPlan.styleVersion != null) {
+    const styleVersion = Number(rawPlan.styleVersion);
+    if (!Number.isInteger(styleVersion) || styleVersion < 1) throw new Error("多素材方案 styleVersion 无效");
+    styleFields.styleVersion = styleVersion;
+  }
+  if (rawPlan.styleParameters != null) {
+    if (typeof rawPlan.styleParameters !== "object" || Array.isArray(rawPlan.styleParameters)) throw new Error("多素材方案 styleParameters 无效");
+    styleFields.styleParameters = Object.fromEntries(Object.entries(rawPlan.styleParameters).map(([key, value]) => {
+      if (!/^[a-zA-Z][a-zA-Z0-9_]{0,60}$/.test(key) || !["string", "number", "boolean"].includes(typeof value)) throw new Error(`多素材方案 styleParameters 无效: ${key}`);
+      return [key, value];
+    }));
+  }
+  if (rawPlan.captionStyle != null) styleFields.captionStyle = normalizeCaptionStyle(rawPlan.captionStyle);
   return {
     version: latestVersion + 1,
     summary: String(rawPlan.summary || "").trim().slice(0, 2000),
@@ -93,6 +126,7 @@ export function validateMultiAssetPlan(rawPlan, project) {
     durationMs,
     durationDeltaRatio,
     warnings,
+    ...styleFields,
     inputRevision: Number(project.multiAssetInputRevision || 0),
     inputFingerprint: inputFingerprint(project),
     confirmed: false,

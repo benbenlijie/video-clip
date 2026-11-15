@@ -5,6 +5,12 @@ import { createHash } from "node:crypto";
 import { detectBlackFrames, probeOutput } from "./render.mjs";
 import { assertAssetsLicensed } from "./multi-asset.mjs";
 import { toTimelineV2 } from "./timeline-v2.mjs";
+import { assertStylePackCompatible } from "./style-pack-store.mjs";
+import { hashStyleProject } from "./style-project.mjs";
+import { deriveUserStyleFacts, detectFaceFrames, evaluateStyleQc, writeStyleQc } from "./style-qc.mjs";
+import { compositeRemotionPreview } from "./remotion-overlay.mjs";
+import { renderStyleProject } from "./style-renderer.mjs";
+import { regroupCaptionCues } from "./style-application.mjs";
 
 function run(command, args) {
   return new Promise((resolve, reject) => {
@@ -15,6 +21,8 @@ function run(command, args) {
     child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${command} failed (${code}): ${stderr.slice(-2000)}`)));
   });
 }
+
+function valueHash(value) { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
 
 function escapeFilterPath(value) {
   return String(value).replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("'", "\\'");
@@ -45,7 +53,65 @@ function expectedMainDimensions(profile) {
   return { width: profile.width, height: profile.height };
 }
 
-async function renderClip({ clip, profile, assetById, overlays, musicPath, fadeMusicIn, fadeMusicOut, outputPath, subtitlePath }) {
+function assColor(value) {
+  const hex = /^#[0-9a-f]{6}$/i.test(String(value || "")) ? String(value).slice(1) : "ffffff";
+  return `&H00${hex.slice(4, 6)}${hex.slice(2, 4)}${hex.slice(0, 2)}`.toUpperCase();
+}
+
+export function subtitleForceStyle(style = {}) {
+  const fontSize = Math.max(8, Math.min(64, Math.round(Number(style.fontSize) || 38)));
+  const marginV = Math.max(0, Math.min(160, Math.round(Number(style.marginV) || 120)));
+  const outline = Math.max(0, Math.min(5, Number(style.outline) || 0));
+  return `FontName=Noto Sans CJK SC,FontSize=${fontSize},PrimaryColour=${assColor(style.color)},Outline=${outline},Shadow=1,Alignment=2,MarginV=${marginV}`;
+}
+
+function timelineCaptions(clips, assetById) {
+  return clips.flatMap((clip) => {
+    const asset = assetById.get(clip.sourceAssetId);
+    if (!asset) return [];
+    return captionsForClip(clip, asset).map((caption) => ({
+      ...caption,
+      startMs: caption.startMs + clip.timelineStartMs,
+      endMs: caption.endMs + clip.timelineStartMs,
+    }));
+  });
+}
+
+function aggregateStyleQc(profileResults) {
+  const first = profileResults[0];
+  if (!first) return null;
+  const hardGates = Object.fromEntries(Object.keys(first.hardGates).map((key) => {
+    const gates = profileResults.map((result) => result.hardGates[key]);
+    return [key, {
+      passed: gates.every((gate) => gate.passed),
+      profiles: profileResults.map((result) => ({ id: result.profileId, ...result.hardGates[key] })),
+      ...(key === "captionsClearOfFace" ? {
+        overlapCount: gates.reduce((sum, gate) => sum + Number(gate.overlapCount || 0), 0),
+        sampledFrameCount: gates.reduce((sum, gate) => sum + Number(gate.sampledFrameCount || 0), 0),
+        detectedFaceCount: gates.reduce((sum, gate) => sum + Number(gate.detectedFaceCount || 0), 0),
+        faceDetectionAvailable: gates.every((gate) => gate.faceDetectionAvailable !== false),
+        requireFaceEvidence: gates.some((gate) => gate.requireFaceEvidence === true),
+      } : {}),
+    }];
+  }));
+  return {
+    contract: "style-qc.v1",
+    checkedAt: new Date().toISOString(),
+    passed: profileResults.every((result) => result.passed),
+    metrics: first.metrics,
+    thresholds: first.thresholds,
+    issues: profileResults.flatMap((result) => result.issues.map((issue) => ({ profile: result.profileId, ...issue }))),
+    hardGates,
+    profiles: profileResults.map((result) => ({
+      id: result.profileId,
+      passed: result.passed,
+      probedAt: result.checkedAt,
+      issues: result.issues,
+    })),
+  };
+}
+
+async function renderClip({ clip, profile, assetById, overlays, musicPath, fadeMusicIn, fadeMusicOut, outputPath, subtitlePath, captionStyle = {} }) {
   const asset = assetById.get(clip.sourceAssetId);
   const durationMs = clip.sourceOutMs - clip.sourceInMs;
   const durationSec = durationMs / 1000;
@@ -68,19 +134,26 @@ async function renderClip({ clip, profile, assetById, overlays, musicPath, fadeM
   }
   args.push("-t", String(durationSec));
 
-  const filters = [`[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,setsar=1[base0]`];
+  const layoutType = clip.layout?.type || "full";
+  const baseFilter = [`[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,setsar=1`];
+  if (layoutType === "punch_in") baseFilter.push(`crop=trunc(iw/1.12):trunc(ih/1.12),scale=${width}:${height}`);
+  baseFilter.push("[base0]");
+  const filters = [baseFilter.join(",").replace(",[base0]", "[base0]")];
   let previous = "base0";
   for (const [index, overlay] of overlays.entries()) {
     const inputIndex = index + 1;
     const next = `base${index + 1}`;
     const start = ((overlay.timelineStartMs - clip.timelineStartMs) / 1000).toFixed(3);
     const end = ((overlay.timelineEndMs - clip.timelineStartMs) / 1000).toFixed(3);
-    filters.push(`[${inputIndex}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,setsar=1,setpts=PTS-STARTPTS+${start}/TB[cutaway${index}]`);
-    filters.push(`[${previous}][cutaway${index}]overlay=0:0:enable='between(t\\,${start}\\,${end})':eof_action=pass[${next}]`);
+    const overlayWidth = layoutType === "split" ? Math.max(2, Math.round(width / 2)) : width;
+    const overlayHeight = height;
+    filters.push(`[${inputIndex}:v]scale=${overlayWidth}:${overlayHeight}:force_original_aspect_ratio=increase,crop=${overlayWidth}:${overlayHeight},fps=30,setsar=1,setpts=PTS-STARTPTS+${start}/TB[cutaway${index}]`);
+    const overlayX = layoutType === "split" ? Math.round(width / 2) : 0;
+    filters.push(`[${previous}][cutaway${index}]overlay=${overlayX}:0:enable='between(t\\,${start}\\,${end})':eof_action=pass[${next}]`);
     previous = next;
   }
   if (subtitlePath) {
-    filters.push(`[${previous}]subtitles='${escapeFilterPath(subtitlePath)}':force_style='FontName=Noto Sans CJK SC,FontSize=38,Outline=3,Shadow=1,Alignment=2,MarginV=120'[vout]`);
+    filters.push(`[${previous}]subtitles='${escapeFilterPath(subtitlePath)}':force_style='${subtitleForceStyle(captionStyle)}'[vout]`);
   } else filters.push(`[${previous}]null[vout]`);
   const voiceInput = asset.hasAudio ? "[0:a:0]" : `[${audioInputIndex}:a:0]`;
   filters.push(`${voiceInput}aresample=48000,apad=pad_dur=1[voice]`);
@@ -121,6 +194,10 @@ async function uniqueArtifactName(artifactsDir, baseName) {
 export async function renderMultiAssetProject(project, { preview = false } = {}) {
   if (project?.workflowMode !== "multi-asset-v1") throw new Error("只有多素材项目可以执行多素材渲染");
   if (!project.multiAssetPlan?.confirmed) throw new Error("方案必须先由用户确认后才能渲染");
+  if (project.multiAssetPlan.stylePackId) {
+    if (!project.stylePack) throw new Error("多素材方案引用了风格包，但项目缺少已审批的 StylePack");
+    assertStylePackCompatible(project.stylePack, "multi-asset-v1");
+  }
   const timeline = toTimelineV2(project);
   assertAssetsLicensed(project);
   const version = preview ? Number(project.multiAssetPlan.version) : await versionFor(project);
@@ -130,9 +207,58 @@ export async function renderMultiAssetProject(project, { preview = false } = {})
   const assetById = new Map(project.assets.map((asset) => [String(asset.id), asset]));
   const mainClips = timeline.clips.filter((clip) => clip.track === "video-main").sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   const overlayClips = timeline.clips.filter((clip) => clip.track === "video-overlay");
+  const unsupportedLayouts = mainClips.filter((clip) => clip.layout?.type === "split" && !overlayClips.some((overlay) => overlay.timelineStartMs >= clip.timelineStartMs && overlay.timelineEndMs <= clip.timelineEndMs)).map((clip) => ({ code: "split-needs-overlay", clipId: clip.id }));
   const profiles = [];
   const artifacts = [];
   let qcPassed = true;
+  const styleMode = Boolean(project.multiAssetPlan.stylePackId);
+  const styleProjectHash = styleMode
+    ? project.styleProjectPath
+      ? await hashStyleProject(project.styleProjectPath)
+      : project.stylePack?.codeSha256 || null
+    : null;
+  if (styleMode && (!styleProjectHash || styleProjectHash !== project.stylePack?.codeSha256)) throw new Error("StyleProject 内容哈希与已审批 StylePack 不一致");
+  if (styleMode && !project.styleProjectPath) throw new Error("当前风格缺少可渲染的 StyleProject");
+  if (styleMode && !/^[a-f0-9]{64}$/i.test(String(project.stylePack?.manifestSha256 || ""))) throw new Error("StylePack 缺少有效 manifest 哈希");
+  const styleCopy = project.styleApplication?.parameters || project.styleCopy || {};
+  const captionStyle = project.multiAssetPlan.captionStyle || { fontSize: 38, marginV: 120, outline: 2, color: "#ffffff" };
+  const layoutEvents = mainClips.map((clip, index) => ({
+    id: `multi-layout-${index + 1}`,
+    type: clip.layout?.type || "full",
+    startMs: Number(clip.timelineStartMs),
+    endMs: Number(clip.timelineEndMs),
+    params: {},
+  }));
+  const styleApplicationEvidence = styleMode ? {
+    parameters: styleCopy,
+    captionPolicy: project.styleApplication?.captionPolicy || null,
+    styleParameters: project.multiAssetPlan.styleParameters || {},
+    captionStyle,
+    layoutEvents,
+  } : null;
+  if (styleMode && project.styleApplicationHash && valueHash(styleApplicationEvidence) !== project.styleApplicationHash) {
+    throw new Error("风格应用参数已变化，请重新应用 StylePack 后再渲染预览");
+  }
+  const styleProvenance = styleMode ? {
+    stylePackId: project.multiAssetPlan.stylePackId,
+    styleVersion: Number(project.multiAssetPlan.styleVersion),
+    styleManifestSha256: String(project.stylePack.manifestSha256).toLowerCase(),
+    styleProjectHash,
+    referenceAnalysisSha256: valueHash(project.referenceAnalysis),
+    styleApplicationSha256: valueHash(styleApplicationEvidence),
+  } : null;
+  const sourceCaptions = timelineCaptions(mainClips, assetById);
+  const captions = regroupCaptionCues(sourceCaptions, project.styleApplication?.captionPolicy?.wordsPerCue);
+  const styleFacts = styleMode
+    ? deriveUserStyleFacts({
+        plan: { ...project.multiAssetPlan, captionStyle },
+        transcript: { segments: captions },
+        media: { width: 1080, height: 1920, durationMs: timeline.durationMs },
+        assets: project.assets,
+      })
+    : null;
+  const styleProfileResults = [];
+  let styleOverlayCount = 0;
   const renderProfiles = timeline.profiles.map((profile) => preview ? { ...profile, width: profile.id === "landscape" ? 960 : 540, height: profile.id === "landscape" ? 540 : 960 } : profile);
   for (const profile of renderProfiles) {
     const workDir = join(workRoot, profile.id);
@@ -142,30 +268,101 @@ export async function renderMultiAssetProject(project, { preview = false } = {})
       const asset = assetById.get(clip.sourceAssetId);
       const overlays = overlayClips.filter((overlay) => overlay.timelineStartMs >= clip.timelineStartMs && overlay.timelineEndMs <= clip.timelineEndMs);
       const subtitlePath = join(workDir, `captions-${index + 1}.srt`);
-      const captions = captionsForClip(clip, asset);
-      if (captions.length) await fs.writeFile(subtitlePath, toSrt(captions), "utf8");
+      const clipCaptions = captionsForClip(clip, asset);
+      if (!styleMode && clipCaptions.length) await fs.writeFile(subtitlePath, toSrt(clipCaptions), "utf8");
       const outputPath = join(workDir, `clip-${index + 1}.mp4`);
-      await renderClip({ clip, profile, assetById, overlays, musicPath: project.music?.path || null, fadeMusicIn: clip.timelineStartMs === 0, fadeMusicOut: clip.timelineEndMs === timeline.durationMs, outputPath, subtitlePath: captions.length ? subtitlePath : null });
+      await renderClip({ clip, profile, assetById, overlays, musicPath: project.music?.path || null, fadeMusicIn: clip.timelineStartMs === 0, fadeMusicOut: clip.timelineEndMs === timeline.durationMs, outputPath, subtitlePath: !styleMode && clipCaptions.length ? subtitlePath : null, captionStyle });
       profileClips.push(outputPath);
     }
     const baseName = preview ? `multi-preview-${profile.id}-p${version}.mp4` : `multi-${profile.id}${version === 1 ? "" : `-v${version}`}.mp4`;
     const name = await uniqueArtifactName(artifactsDir, baseName);
     const outputPath = join(artifactsDir, name);
-    await concatClips(profileClips, join(workDir, "concat.txt"), outputPath);
+    const concatenatedPath = styleMode ? join(workDir, "base.mp4") : outputPath;
+    await concatClips(profileClips, join(workDir, "concat.txt"), concatenatedPath);
+    let profileCaptionStyle = captionStyle;
+    if (styleMode) {
+      const scale = profile.height / 1920;
+      profileCaptionStyle = {
+        ...captionStyle,
+        fontSize: Math.max(8, Math.round(Number(captionStyle.fontSize) * scale)),
+        marginV: Math.max(0, Math.round(Number(captionStyle.marginV) * scale)),
+      };
+      const overlay = await renderStyleProject({
+        projectDir: project.styleProjectPath,
+        compositionId: "ReferenceStyle",
+        outputPath: join(workDir, "style-overlay.mov"),
+        props: {
+          width: profile.width,
+          height: profile.height,
+          fps: 30,
+          durationMs: timeline.durationMs,
+          captions,
+          visualEvents: project.multiAssetPlan.visualEvents || [],
+          layoutEvents,
+          styleParams: project.multiAssetPlan.styleParameters || {},
+          captionStyle: profileCaptionStyle,
+          styleSpec: project.stylePack?.manifest?.styleSpec || null,
+        },
+      });
+      await compositeRemotionPreview({
+        inputPath: concatenatedPath,
+        overlayPath: overlay.outputPath,
+        outputPath,
+        subtitlePath: null,
+        durationMs: timeline.durationMs,
+        phase: preview ? "plan" : "render",
+      });
+      const overlayName = await uniqueArtifactName(artifactsDir, preview ? `multi-style-overlay-${profile.id}-p${version}.mov` : `multi-style-overlay-${profile.id}-v${version}.mov`);
+      await fs.copyFile(overlay.outputPath, join(artifactsDir, overlayName));
+      artifacts.push({ name: overlayName, kind: "style-overlay", profile: profile.id, version, planVersion: Number(project.multiAssetPlan.version), inputRevision: Number(project.multiAssetRevision || 0), width: overlay.width, height: overlay.height, durationMs: overlay.durationMs, stylePackId: project.multiAssetPlan.stylePackId, styleVersion: project.multiAssetPlan.styleVersion, networkIsolated: overlay.networkIsolated === true });
+      styleOverlayCount += 1;
+    }
     const probe = await probeOutput(outputPath);
     const blackFrames = await detectBlackFrames(outputPath);
     const expected = expectedMainDimensions(profile);
     const delta = timeline.brief.targetDurationMs ? Math.abs(probe.durationMs - timeline.brief.targetDurationMs) / timeline.brief.targetDurationMs : 0;
-    const passed = probe.width === expected.width && probe.height === expected.height && probe.hasVideo && probe.hasAudio && probe.avSyncDeltaMs !== null && probe.avSyncDeltaMs <= 250 && probe.avDurationDeltaMs !== null && probe.avDurationDeltaMs <= 250 && blackFrames.length === 0;
+    let styleQc = null;
+    if (styleMode) {
+      let faceFrames = [];
+      let faceDetectionAvailable = true;
+      try {
+        faceFrames = await detectFaceFrames(outputPath, { maxSamples: 12 });
+      } catch {
+        faceDetectionAvailable = false;
+      }
+      styleQc = await evaluateStyleQc({
+        referenceAnalysis: project.referenceAnalysis,
+        userFacts: styleFacts,
+        render: {
+          probe,
+          blackFrames,
+          inputHashes: project.assets.map((asset) => asset.sha256).filter(Boolean),
+          assetsLicensed: project.assets.every((asset) => asset.licenseConfirmed === true) && (!project.music || project.music.licenseConfirmed === true),
+          styleProjectHash,
+        },
+        expectedStyleProjectHash: project.stylePack?.codeSha256 || null,
+        captions,
+        captionStyle: profileCaptionStyle,
+        faceFrames,
+        faceDetectionAvailable,
+        copy: styleCopy,
+      });
+      styleProfileResults.push({ ...styleQc, profileId: profile.id });
+    }
+    const passed = probe.width === expected.width && probe.height === expected.height && probe.hasVideo && probe.hasAudio && probe.avSyncDeltaMs !== null && probe.avSyncDeltaMs <= 250 && probe.avDurationDeltaMs !== null && probe.avDurationDeltaMs <= 250 && blackFrames.length === 0 && (!styleQc || styleQc.passed);
     qcPassed &&= passed;
-    profiles.push({ id: profile.id, probe, blackFrameCount: blackFrames.length, durationDeltaRatio: delta, passed });
+    profiles.push({ id: profile.id, probe, blackFrameCount: blackFrames.length, durationDeltaRatio: delta, passed, ...(styleQc ? { styleQc: { passed: styleQc.passed, metrics: styleQc.metrics, issues: styleQc.issues } } : {}) });
     artifacts.push({ name, kind: preview ? "preview" : "video", profile: profile.id, version, planVersion: Number(project.multiAssetPlan.version), inputRevision: Number(project.multiAssetRevision || 0), width: probe.width, height: probe.height, durationMs: probe.durationMs });
   }
   const timelineName = preview ? null : await uniqueArtifactName(artifactsDir, `timeline-v2-v${version}.json`);
   const qcName = await uniqueArtifactName(artifactsDir, preview ? `multi-preview-p${version}-qc.json` : `multi-qc-v${version}.json`);
+  const styleQc = styleMode ? aggregateStyleQc(styleProfileResults) : null;
+  if (styleQc && styleProvenance) styleQc.styleProvenance = styleProvenance;
+  const styleQcName = styleMode ? await uniqueArtifactName(artifactsDir, preview ? `multi-preview-p${version}-style-qc.json` : `multi-style-qc-v${version}.json`) : null;
   if (timelineName) await fs.writeFile(join(artifactsDir, timelineName), `${JSON.stringify(timeline, null, 2)}\n`);
+  if (styleQc && styleQcName) await writeStyleQc(join(artifactsDir, styleQcName), styleQc);
   const qc = {
-    passed: qcPassed,
+    passed: qcPassed && (!styleQc || styleQc.passed),
     checkedAt: new Date().toISOString(),
     version,
     planVersion: Number(project.multiAssetPlan.version),
@@ -173,16 +370,30 @@ export async function renderMultiAssetProject(project, { preview = false } = {})
     sourceAssetCount: new Set(mainClips.map((clip) => clip.sourceAssetId)).size,
     plannedClipCount: mainClips.length,
     appliedClipCount: mainClips.length,
+    stylePackId: project.multiAssetPlan.stylePackId || null,
+    styleVersion: project.multiAssetPlan.styleVersion || null,
+    styleProvenance,
+    styleApplicationEvidence,
+    styleOverlayCount,
+    styleQc: styleQc ? { contract: styleQc.contract, passed: styleQc.passed, metrics: styleQc.metrics, issues: styleQc.issues, hardGates: styleQc.hardGates, profiles: styleQc.profiles } : null,
     profileCount: profiles.length,
     profiles,
     subtitlesBurnedIn: project.assets.some((asset) => (asset.transcript?.segments || []).length > 0),
     musicMixed: Boolean(project.music?.path),
     requiresHumanReview: true,
-    warnings: [...(timeline.warnings || []), ...profiles.filter((profile) => profile.durationDeltaRatio > 0.1).map((profile) => ({ code: "duration-target-exceeded", profile: profile.id, deltaRatio: profile.durationDeltaRatio }))],
+    warnings: [...(timeline.warnings || []), ...unsupportedLayouts, ...profiles.filter((profile) => profile.durationDeltaRatio > 0.1).map((profile) => ({ code: "duration-target-exceeded", profile: profile.id, deltaRatio: profile.durationDeltaRatio }))],
   };
   await fs.writeFile(join(artifactsDir, qcName), `${JSON.stringify(qc, null, 2)}\n`);
   if (timelineName) artifacts.push({ name: timelineName, kind: "timeline", version, planVersion: Number(project.multiAssetPlan.version), inputRevision: Number(project.multiAssetRevision || 0) });
+  if (styleQcName) artifacts.push({ name: styleQcName, kind: "style-qc", version, planVersion: Number(project.multiAssetPlan.version), inputRevision: Number(project.multiAssetRevision || 0), preview });
   artifacts.push({ name: qcName, kind: "qc", version, planVersion: Number(project.multiAssetPlan.version), inputRevision: Number(project.multiAssetRevision || 0), preview });
-  if (!qc.passed) throw new Error(preview ? "多素材预览未通过尺寸、音画同步、黑帧或目标时长检查" : "多素材成片未通过尺寸、音画同步、黑帧或目标时长检查");
+  if (!qc.passed) {
+    const reasons = [
+      ...profiles.filter((profile) => !profile.passed).flatMap((profile) => profile.styleQc?.issues?.map((issue) => `${profile.id}:${issue.metric || issue.code}`) || [`${profile.id}:profile`]),
+      ...(styleQc?.issues?.map((issue) => issue.profile ? `${issue.profile}:${issue.metric || issue.code}` : issue.metric || issue.code) || []),
+      ...Object.entries(styleQc?.hardGates || {}).filter(([, gate]) => !gate.passed).map(([name]) => `hard-gate:${name}`),
+    ];
+    throw new Error(`${preview ? "多素材预览" : "多素材成片"}未通过 QC${reasons.length ? `: ${[...new Set(reasons)].join(", ")}` : ""}`);
+  }
   return { artifacts, qc, profiles, timeline };
 }

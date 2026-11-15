@@ -17,7 +17,7 @@ const media = { filename: "input.mp4", durationMs: 2000, width: 320, height: 180
 const projectId = "claude-remotion-fixture";
 const originalTranscript = { provider: "volcengine", language: "zh", text: "把烦做的剪辑工具交给AI", durationMs: 2000, segments: [{ id: "segment-1", startMs: 100, endMs: 1600, text: "把烦做的剪辑工具交给AI" }] };
 const secondaryTranscript = { provider: "whisper.cpp", model: "small_q5_1", language: "zh", text: "把繁琐的剪辑工具交给AI", durationMs: 2000, segments: [{ id: "whisper-1", startMs: 100, endMs: 1600, text: "把繁琐的剪辑工具交给AI" }] };
-const transcript = { ...originalTranscript, text: secondaryTranscript.text, segments: [{ ...originalTranscript.segments[0], text: secondaryTranscript.segments[0].text }] };
+const transcript = { ...originalTranscript, text: secondaryTranscript.text, segments: [{ ...originalTranscript.segments[0], text: secondaryTranscript.segments[0].text, wordTimingStatus: "protected" }] };
 await fs.mkdir(control, { recursive: true });
 const ffmpeg = spawn("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0x334433:s=320x180:r=30:d=2", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", inputPath]);
 let ffmpegError = "";
@@ -28,7 +28,11 @@ const downloadedBrollSha256 = createHash("sha256").update(await fs.readFile(path
 
 const plan = {
   summary: "Remotion comparison fixture",
-  segments: [{ id: "segment-1", startMs: 0, endMs: 2000, action: "keep", title: "Hook", note: "" }],
+  segments: [
+    { id: "keep-before", startMs: 0, endMs: 300, action: "keep", title: "Before", note: "" },
+    { id: "trim-middle", startMs: 300, endMs: 1300, action: "remove", title: "Trim", note: "" },
+    { id: "keep-after", startMs: 1300, endMs: 2000, action: "keep", title: "After", note: "" },
+  ],
   shorts: [],
   visualEvents: [{ id: "hook", type: "title_card", startMs: 100, endMs: 1600, text: "真实样片", subtext: "Remotion 对照" }],
   brollEvents: [{ id: "broll-1", assetId: "downloaded-broll-1", startMs: 200, endMs: 700, sourceStartMs: 100 }],
@@ -53,9 +57,14 @@ const client = new Client({ name: "claude-remotion-tools-verify", version: "1.0.
 try {
   await client.connect(transport);
   await fs.writeFile(path.join(root, "remotion-preview-1.mp4"), "previous attempt output");
+  const adjusted = await client.callTool({ name: "render_remotion_preview", arguments: {} });
+  const adjustment = JSON.parse(adjusted.content.find((item) => item.type === "text").text);
+  assert.deepEqual(adjustment.protectedTranscriptSegmentIds, ["segment-1"], "Remotion render must report protected corrections before rendering");
+  await fs.writeFile(path.join(root, "edit-plan.json"), JSON.stringify({ ...plan, segments: [{ id: "protected", startMs: 100, endMs: 1600, action: "keep", title: "Protected", note: "" }] }));
   const rendered = await client.callTool({ name: "render_remotion_preview", arguments: {} });
   assert.equal(rendered.isError, undefined, JSON.stringify(rendered));
   const result = JSON.parse(rendered.content.find((item) => item.type === "text").text);
+  assert.deepEqual(result.protectedTranscriptSegmentIds, [], "a rerender after plan normalization has no pending protection");
   assert.equal(result.engine, "remotion");
   assert.match(result.remotionVersion, /^4\.0\./);
   assert.equal(result.width, media.width);
@@ -90,6 +99,10 @@ try {
   assert.ok(logged.some((entry) => entry.tool === "render_remotion_preview" && entry.previewPath === result.previewPath));
   const storedPreview = saved.artifacts.find((artifact) => artifact.kind === "remotion-preview");
   assert.equal(createHash("sha256").update(await fs.readFile(path.join(root, "artifacts", storedPreview.name))).digest("hex"), result.sha256.preview);
+  const currentPlan = JSON.parse(await fs.readFile(path.join(root, "edit-plan.json"), "utf8"));
+  await fs.writeFile(path.join(root, "edit-plan.json"), JSON.stringify({ ...currentPlan, segments: [{ startMs: 100, endMs: 1000, action: "keep" }] }));
+  await assert.rejects(validateAgentOutput(root, "plan"), /字幕无法校验.*segment-1/, "final QC must reject a protected correction cut that bypassed plan normalization");
+  await fs.writeFile(path.join(root, "edit-plan.json"), JSON.stringify(currentPlan));
   await fs.writeFile(path.join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:01,600\n把凡速的剪辑工具交给AI\n");
   await assert.rejects(validateAgentOutput(root, "plan"), /字幕文字与当前校对转录不一致/);
   await fs.writeFile(path.join(root, "captions.srt"), "1\n00:00:00,100 --> 00:00:01,600\n把繁琐的剪辑工具交给AI\n");

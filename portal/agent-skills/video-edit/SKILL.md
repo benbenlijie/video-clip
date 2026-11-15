@@ -12,11 +12,33 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 1. `brief.json`：本轮目标、风格、批注和媒体信息；
 2. `transcript.json`：逐词或逐句时间戳；
 3. `assets.json`：已授权的 B-roll 和配乐；
-4. `.claude/skills/video-edit/references/public-skill-audit.md`：公开 Skill 的来源与采用边界；
-5. `.claude/skills/video-edit/references/editorial-grammar.md`：Wayne/Cutline 编辑语法、镜头角色、字幕、声音和品牌令牌；
-6. `.claude/skills/video-edit/references/verification.md`：预览与终稿验证门禁。
+4. `style-transfer.json`：如果存在，表示当前项目复用了已审批的 StylePack；同时读取 `style-project/style-manifest.json`；
+5. `.claude/skills/video-edit/references/public-skill-audit.md`：公开 Skill 的来源与采用边界；
+6. `.claude/skills/video-edit/references/editorial-grammar.md`：Wayne/Cutline 编辑语法、镜头角色、字幕、声音和品牌令牌；
+7. `.claude/skills/video-edit/references/verification.md`：预览与终稿验证门禁。
 
 这些规则吸收了公开的 MIT/Apache-2.0 项目经验，但不复制它们的品牌、字体、模板或外部素材流程。当前工作区的输入输出、MCP 工具和服务器 QC 是最终契约。
+
+## 复用 StylePack
+
+`style-transfer.json` 存在时，它描述的是可跨项目复用的视觉语法，不是当前参考视频的内容。必须：
+
+- 使用其中的 `styleSpec` 控制标题、身份卡、字幕底板、字体、描边、阴影、强调色、布局锚点和 enter/exit 动效；
+- 只把用户自己的 `transcript.json` 和素材写入计划和字幕，不能复用参考视频的原文案、OCR、人物、画面、声音或品牌；
+- 使用 `style-project/` 作为当前项目的风格工程，不另写一套竞争风格；
+- 保留 `stylePackId/styleVersion/styleProjectHash/styleManifestSha256`，供服务器重新应用到新计划并记录 provenance；
+- 若 `style-transfer.json.application.parameters` 关闭的字幕、节奏、布局、B-roll 或声音能力，不得在计划中偷偷重新开启。
+
+这份环境没有 `style-transfer.json` 时，才按普通 video-edit 设计规则处理。
+
+标题、副标题、身份卡和 CTA 必须来自当前用户的转录、真实画面、文件名或用户 brief。
+在写 `edit-plan.json` 之前先写 `content-copy.json`，格式为
+`{"contract":"content-copy.v1","title":"","subtitle":"","identity":"","identitySubtext":"","cta":"","evidence":{}}`。
+每个非空字段必须在 `evidence` 中记录依据：`transcript`、`frame`、`filename` 或
+`brief`。禁止把“风格预览”“用户自己的标题”“用户身份信息”“口播样片”“6 秒预览”
+等技术占位文案写进正式预览或成片。找不到可信身份就省略身份区，不能编造人物姓名、
+职业或品牌。`edit-plan.json.visualEvents` 的文案应从 `content-copy.json` 取值，并把
+`content-copy.json` 列入 `manifest.sources` 以便追溯。
 
 ## 主视频制作方式
 
@@ -82,6 +104,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 - 旧工程中 HyperFrames 不是可选装饰：在可用时至少制作一个 Hook、重点或转场动效，并在 `manifest.sources` 和 `manifest.review.notes` 中列出实际执行的动效源与审片时间。新主模式用 Remotion 实现并验收同样的真实动效。
 - 人脸特写字幕放在胸口或安全带，通常 1–2 行；不能遮挡眼睛、嘴或屏幕关键内容。不要同时显示内容完全重复的标题和字幕。
 - 字幕必须覆盖所有保留的口播。如果某些口播词由对应时间的 HyperFrames 动效逐字呈现、因此从 `captions.srt` 隐藏，必须在 `edit-plan.json.captionCoverage` 中写出 `eventId`、精确源时间和逐字文本；不能用概述或语义相近的文案代替。该词句必须能在 `manifest.sources` 声明的 HTML/JS 动效源码中找到，并在成片审片帧中确认。
+- `captions.srt` 的换行必须落在完整语义处，优先使用标点和自然停顿；不能把一个词、完整名词、专有名词或固定短语拆到两段字幕中。中文换行不能让下一句以“的、地、得、了、着、过、和、与、及、或、而、但、却、并、且”开头。
 - A-roll 是声音骨架；B-roll 覆盖画面但不能改变口播事实。B-roll 必须有来源、许可和最终审片帧。
 - 配乐必须低于人声并自动 duck。可使用 `ffmpeg` 合成短 SFX；最终目标参考为约 `-16 LUFS`、真峰值不高于 `-1.5 dBTP`，噪声被放大时要写入限制。
 

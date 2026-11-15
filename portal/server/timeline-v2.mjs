@@ -2,6 +2,7 @@ import { assertAssetsLicensed, assertMultiAssetReady } from "./multi-asset.mjs";
 
 export const TIMELINE_V2 = "timeline.v2";
 const ALLOWED_TRACKS = new Set(["video-main", "video-overlay"]);
+const LAYOUT_TYPES = new Set(["full", "punch_in", "split", "broll_cover", "unknown"]);
 const PROFILE_SPECS = {
   landscape: { width: 1920, height: 1080 },
   portrait: { width: 1080, height: 1920 },
@@ -42,7 +43,7 @@ function normalizeClip(clip, index) {
   if (timelineStartMs < 0 || timelineEndMs <= timelineStartMs || timelineEndMs - timelineStartMs !== sourceOutMs - sourceInMs) throw new Error(`时间轴区间无效: ${index + 1}`);
   const track = String(clip.track || "video-main");
   if (!ALLOWED_TRACKS.has(track)) throw new Error(`不支持的时间轴轨道: ${track}`);
-  return {
+  const result = {
     id: String(clip.id || `clip-${index + 1}`),
     sourceAssetId: String(clip.sourceAssetId || ""),
     sourceInMs: Math.round(sourceInMs),
@@ -54,11 +55,23 @@ function normalizeClip(clip, index) {
     reason: String(clip.reason || "").slice(0, 500),
     ...(clip.audioPolicy ? { audioPolicy: String(clip.audioPolicy) } : {}),
   };
+  if (clip.shotRole != null) {
+    if (!LAYOUT_TYPES.has(String(clip.shotRole))) throw new Error(`镜头角色无效: ${result.id}`);
+    result.shotRole = String(clip.shotRole);
+  }
+  if (clip.layout != null) {
+    if (typeof clip.layout !== "object" || Array.isArray(clip.layout) || !LAYOUT_TYPES.has(String(clip.layout.type))) throw new Error(`布局类型无效: ${result.id}`);
+    result.layout = { type: String(clip.layout.type), params: clip.layout.params ? { ...clip.layout.params } : {} };
+  }
+  return result;
 }
 
 export function validateTimelineV2(timeline, project) {
   if (!timeline || timeline.contract !== TIMELINE_V2) throw new Error("需要 timeline.v2 契约");
   if (timeline.project?.id !== String(project.id)) throw new Error("时间轴项目 ID 不匹配");
+  if (timeline.project?.stylePackId != null && !/^[a-z0-9][a-z0-9-]{2,80}$/.test(String(timeline.project.stylePackId))) throw new Error("时间轴 stylePackId 无效");
+  if (timeline.project?.styleVersion != null && (!Number.isInteger(Number(timeline.project.styleVersion)) || Number(timeline.project.styleVersion) < 1)) throw new Error("时间轴 styleVersion 无效");
+  if (timeline.project?.styleParameters != null && (typeof timeline.project.styleParameters !== "object" || Array.isArray(timeline.project.styleParameters))) throw new Error("时间轴 styleParameters 无效");
   const assets = assertMultiAssetReady(project);
   const assetById = new Map(assets.map((asset) => [String(asset.id), asset]));
   const clips = (timeline.clips || []).map(normalizeClip);
@@ -98,7 +111,16 @@ export function toTimelineV2(project) {
   const durationMs = main.at(-1)?.timelineEndMs || 0;
   const timeline = {
     contract: TIMELINE_V2,
-    project: { id: String(project.id), workflowMode: project.workflowMode, goal: String(project.goal || ""), style: String(project.style || ""), version: Math.max(1, Number(project.multiAssetPlan?.version) || 1) },
+    project: {
+      id: String(project.id),
+      workflowMode: project.workflowMode,
+      goal: String(project.goal || ""),
+      style: String(project.style || ""),
+      version: Math.max(1, Number(project.multiAssetPlan?.version) || 1),
+      ...(project.multiAssetPlan?.stylePackId ? { stylePackId: String(project.multiAssetPlan.stylePackId) } : {}),
+      ...(project.multiAssetPlan?.styleVersion ? { styleVersion: Number(project.multiAssetPlan.styleVersion) } : {}),
+      ...(project.multiAssetPlan?.styleParameters ? { styleParameters: { ...project.multiAssetPlan.styleParameters } } : {}),
+    },
     brief: { ...project.brief },
     assets: assets.map(safeAsset),
     audio: {

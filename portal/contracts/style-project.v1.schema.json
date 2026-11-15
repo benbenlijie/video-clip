@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/style-project.v1.schema.json",
+  "title": "StyleProject.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "id", "version", "dir", "entryPoint", "compositionId", "manifest", "manifestSha256", "codeSha256", "status"],
+  "properties": {
+    "contract": { "const": "style-project.v1" },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,80}$" },
+    "version": { "type": "integer", "minimum": 1 },
+    "dir": { "type": "string", "minLength": 1 },
+    "entryPoint": { "type": "string", "pattern": "^src/[A-Za-z0-9_./-]+\\.(tsx|ts|jsx|js)$" },
+    "compositionId": { "type": "string", "minLength": 1 },
+    "manifest": {
+      "oneOf": [
+        { "$ref": "style-manifest.v1.schema.json" },
+        { "$ref": "style-manifest.v2.schema.json" }
+      ]
+    },
+    "manifestSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "codeSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "status": { "enum": ["draft", "pending_approval", "approved", "rejected"] }
+  }
+}

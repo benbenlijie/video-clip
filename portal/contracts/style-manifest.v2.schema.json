@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/style-manifest.v2.schema.json",
+  "title": "StyleManifest.v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "id", "name", "version", "status", "sourceAnalysisId", "supportedModes", "parameters", "capabilities", "requirements", "unsupported", "preview", "styleSpec"],
+  "properties": {
+    "contract": { "const": "style-manifest.v2" },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,80}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "version": { "type": "integer", "minimum": 1 },
+    "status": { "enum": ["draft", "pending_approval", "approved", "rejected"] },
+    "sourceAnalysisId": { "type": "string", "minLength": 1 },
+    "supportedModes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["single-video-v1", "multi-asset-v1"] }
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number", "boolean"] }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "enum": ["captions", "title_card", "emphasis", "cta", "callout", "punch_in", "split", "broll_cover"] }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minAssets", "needsMainFootage", "needsBroll"],
+      "properties": {
+        "minAssets": { "type": "integer", "minimum": 1 },
+        "needsMainFootage": { "type": "boolean" },
+        "needsBroll": { "type": "boolean" }
+      }
+    },
+    "unsupported": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "preview": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["video", "poster"],
+          "properties": {
+            "video": { "type": "string", "minLength": 1 },
+            "poster": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "styleSpec": { "$ref": "style-spec.v2.schema.json" }
+  }
+}

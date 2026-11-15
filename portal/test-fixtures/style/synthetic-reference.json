@@ -1,0 +1,83 @@
+{
+  "contract": "style-fixtures.v1",
+  "references": [
+    {
+      "id": "ref-portrait-captions-broll",
+      "aspectRatio": "9:16",
+      "durationMs": 42000,
+      "hasCaptions": true,
+      "hasBroll": true,
+      "expectedLayouts": ["full", "punch_in", "broll_cover"]
+    },
+    {
+      "id": "ref-landscape-captions-no-broll",
+      "aspectRatio": "16:9",
+      "durationMs": 60000,
+      "hasCaptions": true,
+      "hasBroll": false,
+      "expectedLayouts": ["full", "punch_in"]
+    },
+    {
+      "id": "ref-portrait-no-captions-broll",
+      "aspectRatio": "9:16",
+      "durationMs": 36000,
+      "hasCaptions": false,
+      "hasBroll": true,
+      "expectedLayouts": ["full", "broll_cover"]
+    },
+    {
+      "id": "ref-landscape-no-captions-no-broll",
+      "aspectRatio": "16:9",
+      "durationMs": 48000,
+      "hasCaptions": false,
+      "hasBroll": false,
+      "expectedLayouts": ["full"]
+    },
+    {
+      "id": "ref-portrait-captions-broll-long",
+      "aspectRatio": "9:16",
+      "durationMs": 180000,
+      "hasCaptions": true,
+      "hasBroll": true,
+      "expectedLayouts": ["full", "punch_in", "broll_cover", "split"]
+    },
+    {
+      "id": "ref-landscape-captions-broll",
+      "aspectRatio": "16:9",
+      "durationMs": 120000,
+      "hasCaptions": true,
+      "hasBroll": true,
+      "expectedLayouts": ["full", "punch_in", "broll_cover"]
+    }
+  ],
+  "userMedia": [
+    {
+      "id": "user-single-portrait",
+      "aspectRatio": "9:16",
+      "mode": "single-video-v1",
+      "assetCount": 1,
+      "hasBroll": false
+    },
+    {
+      "id": "user-single-landscape",
+      "aspectRatio": "16:9",
+      "mode": "single-video-v1",
+      "assetCount": 1,
+      "hasBroll": false
+    },
+    {
+      "id": "user-multi-portrait",
+      "aspectRatio": "9:16",
+      "mode": "multi-asset-v1",
+      "assetCount": 4,
+      "hasBroll": true
+    },
+    {
+      "id": "user-multi-landscape",
+      "aspectRatio": "16:9",
+      "mode": "multi-asset-v1",
+      "assetCount": 4,
+      "hasBroll": true
+    }
+  ]
+}

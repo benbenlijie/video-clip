@@ -1,0 +1,124 @@
+{
+  "contract": "style-golden-labels.v1",
+  "rubricVersion": "2026-11-13",
+  "datasetStatus": "template-not-reviewed",
+  "reviewThresholds": {
+    "hardQcMinimumPasses": 8,
+    "meanStyleSimilarity": 3.8,
+    "meanEditNaturalness": 4,
+    "meanSubtitleReadability": 4.2,
+    "minimumWillingToDeliver": 8
+  },
+  "pairs": [
+    {
+      "id": "single-01",
+      "mode": "single-video-v1",
+      "aspectRatio": "9:16",
+      "reference": { "path": null, "sha256": null, "hasCaptions": true, "hasBroll": true },
+      "user": { "path": null, "sha256": null, "assetCount": 1 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "single-02",
+      "mode": "single-video-v1",
+      "aspectRatio": "16:9",
+      "reference": { "path": null, "sha256": null, "hasCaptions": true, "hasBroll": false },
+      "user": { "path": null, "sha256": null, "assetCount": 1 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "single-03",
+      "mode": "single-video-v1",
+      "aspectRatio": "9:16",
+      "reference": { "path": null, "sha256": null, "hasCaptions": false, "hasBroll": true },
+      "user": { "path": null, "sha256": null, "assetCount": 1 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "single-04",
+      "mode": "single-video-v1",
+      "aspectRatio": "16:9",
+      "reference": { "path": null, "sha256": null, "hasCaptions": false, "hasBroll": false },
+      "user": { "path": null, "sha256": null, "assetCount": 1 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "single-05",
+      "mode": "single-video-v1",
+      "aspectRatio": "9:16",
+      "reference": { "path": null, "sha256": null, "hasCaptions": true, "hasBroll": false },
+      "user": { "path": null, "sha256": null, "assetCount": 1 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "multi-01",
+      "mode": "multi-asset-v1",
+      "aspectRatio": "16:9",
+      "reference": { "path": null, "sha256": null, "hasCaptions": true, "hasBroll": true },
+      "user": { "path": null, "sha256": null, "assetCount": 4 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "multi-02",
+      "mode": "multi-asset-v1",
+      "aspectRatio": "9:16",
+      "reference": { "path": null, "sha256": null, "hasCaptions": true, "hasBroll": false },
+      "user": { "path": null, "sha256": null, "assetCount": 3 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "multi-03",
+      "mode": "multi-asset-v1",
+      "aspectRatio": "16:9",
+      "reference": { "path": null, "sha256": null, "hasCaptions": false, "hasBroll": true },
+      "user": { "path": null, "sha256": null, "assetCount": 5 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "multi-04",
+      "mode": "multi-asset-v1",
+      "aspectRatio": "9:16",
+      "reference": { "path": null, "sha256": null, "hasCaptions": false, "hasBroll": false },
+      "user": { "path": null, "sha256": null, "assetCount": 3 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    },
+    {
+      "id": "multi-05",
+      "mode": "multi-asset-v1",
+      "aspectRatio": "16:9",
+      "reference": { "path": null, "sha256": null, "hasCaptions": true, "hasBroll": true },
+      "user": { "path": null, "sha256": null, "assetCount": 6 },
+      "stylePack": { "id": null, "version": null },
+      "styleQc": { "path": null, "sha256": null, "passed": null },
+      "humanReview": { "styleSimilarity": null, "subtitleReadability": null, "editNaturalness": null, "willingToDeliver": null, "primaryFailureCodes": [], "notes": "" },
+      "consent": { "referenceClearedForEvaluation": false, "userMediaClearedForEvaluation": false, "reviewerIds": [] }
+    }
+  ]
+}

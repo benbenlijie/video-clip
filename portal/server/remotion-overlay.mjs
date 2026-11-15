@@ -110,17 +110,41 @@ export async function renderRemotionOverlay({ timeline, outputPath, workDir = di
   }
 }
 
-export async function compositeRemotionPreview({ inputPath, overlayPath, outputPath, subtitlePath = null, captionStyle = { fontSize: 20, outline: 1, marginV: 24, color: "#ffffff" }, durationMs = null, phase = "plan" }) {
+function punchInWindows(layoutEvents, durationMs) {
+  return (layoutEvents || []).flatMap((event, index) => {
+    if (event?.type !== "punch_in") return [];
+    const startMs = Math.max(0, Number(event.startMs));
+    const endMs = Math.min(Number(durationMs) || Number(event.endMs), Number(event.endMs));
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
+    return [{ id: String(event.id || index + 1), startMs, endMs }];
+  });
+}
+
+export async function compositeRemotionPreview({ inputPath, overlayPath, outputPath, subtitlePath = null, captionStyle = { fontSize: 20, outline: 1, marginV: 24, color: "#ffffff" }, durationMs = null, layoutEvents = [], phase = "plan" }) {
   const target = resolve(outputPath);
   await fs.mkdir(dirname(target), { recursive: true });
   await fs.access(target).then(() => { throw new Error("Refusing to overwrite an existing preview output"); }, () => undefined);
   try {
     const escapedSubtitle = subtitlePath ? resolve(subtitlePath).replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("'", "\\'") : null;
     const color = captionStyle.color.slice(5, 7) + captionStyle.color.slice(3, 5) + captionStyle.color.slice(1, 3);
-    const filter = `[0:v][1:v]overlay=0:0:format=auto:eof_action=pass${escapedSubtitle ? `,subtitles='${escapedSubtitle}':force_style='FontName=Noto Sans CJK SC,FontSize=${captionStyle.fontSize},Outline=${captionStyle.outline},Alignment=2,MarginV=${captionStyle.marginV},PrimaryColour=&H00${color}'` : ""}[v]`;
+    const punchIns = punchInWindows(layoutEvents, durationMs);
+    const filters = [];
+    let baseLabel = "0:v";
+    if (punchIns.length) {
+      const sourceLabels = punchIns.map((_, index) => `punchsrc${index}`);
+      filters.push(`[0:v]split=${punchIns.length + 1}[layoutbase]${sourceLabels.map((label) => `[${label}]`).join("")}`);
+      baseLabel = "layoutbase";
+      punchIns.forEach((event, index) => {
+        const next = `layout${index + 1}`;
+        filters.push(`[${sourceLabels[index]}]crop=w=trunc(iw/1.12):h=trunc(ih/1.12):x=(iw-ow)/2:y=(ih-oh)/2,scale=ceil(iw*1.12):ceil(ih*1.12),setsar=1[punchzoom${index}]`);
+        filters.push(`[${baseLabel}][punchzoom${index}]overlay=0:0:format=auto:enable='between(t\\,${(event.startMs / 1000).toFixed(3)}\\,${(event.endMs / 1000).toFixed(3)})'[${next}]`);
+        baseLabel = next;
+      });
+    }
+    filters.push(`[${baseLabel}][1:v]overlay=0:0:format=auto:eof_action=pass${escapedSubtitle ? `,subtitles='${escapedSubtitle}':force_style='FontName=Noto Sans CJK SC,FontSize=${captionStyle.fontSize},Outline=${captionStyle.outline},Alignment=2,MarginV=${captionStyle.marginV},PrimaryColour=&H00${color}'` : ""}[v]`);
     await run("ffmpeg", [
       "-y", "-hide_banner", "-i", resolve(inputPath), "-i", resolve(overlayPath),
-      "-filter_complex", filter,
+      "-filter_complex", filters.join(";"),
       "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", phase === "render" ? "20" : "24",
       "-c:a", "copy", ...(durationMs ? ["-t", String(durationMs / 1000)] : []), "-shortest", "-movflags", "+faststart", target,
     ], portalRoot);

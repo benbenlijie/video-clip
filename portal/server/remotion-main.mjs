@@ -8,6 +8,10 @@ import { detectBlackFrames, probeOutput } from "./render.mjs";
 import { parseWhisperSrt } from "./local-whisper.mjs";
 import { subtitlesMatchTranscript, transcriptFingerprint } from "./transcript-proofreading.mjs";
 import { normalizeCaptionStyle } from "./edit-plan.mjs";
+import { hashStyleProject, validateStyleManifest } from "./style-project.mjs";
+import { renderStyleProject } from "./style-renderer.mjs";
+import { deriveUserStyleFacts, detectFaceFrames, evaluateStyleQc, writeStyleQc } from "./style-qc.mjs";
+import { regroupCaptionCues } from "./style-application.mjs";
 
 const SUPPORTED_EVENTS = new Set(["title_card", "emphasis", "cta"]);
 export const REMOTION_MAIN_MODE = "remotion-main.v1";
@@ -74,6 +78,19 @@ export function mapRemotionEvents(events, pieces) {
   });
 }
 
+export function mapLayoutEvents(events, pieces) {
+  return (events || []).flatMap((event) => {
+    if (!["full", "punch_in", "split", "broll_cover", "unknown"].includes(event.type)) throw new Error(`不支持的布局事件类型: ${event.type}`);
+    if (!event.id || !Number.isFinite(event.startMs) || !Number.isFinite(event.endMs) || event.startMs < 0 || event.endMs <= event.startMs) throw new Error("布局事件时间无效");
+    return pieces.flatMap((piece, index) => {
+      const start = Math.max(event.startMs, piece.src[0]);
+      const end = Math.min(event.endMs, piece.src[1]);
+      if (end <= start) return [];
+      return [{ ...event, id: `${event.id}-part-${index + 1}`, sourceEventId: event.id, startMs: start - piece.src[0] + piece.out[0], endMs: end - piece.src[0] + piece.out[0] }];
+    });
+  });
+}
+
 export async function composeRemotionMain({ root, baseVideo, phase }) {
   if (!["plan", "chat-edit", "render"].includes(phase)) throw new Error("主视频合成阶段无效");
   const readJson = async (name) => JSON.parse(await fs.readFile(await workspacePath(root, name), "utf8"));
@@ -89,29 +106,152 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
   const transcript = await readJson("transcript.json");
   const captions = await fs.readFile(await workspacePath(root, "captions.srt"), "utf8");
   if (!subtitlesMatchTranscript(captions, transcript, plan, events.map((event) => `${event.text} ${event.subtext || ""}`), pieces, events)) throw new Error("字幕与保留口播或剪辑后时码不一致，请先修正 captions.srt");
-  const sourceFiles = { source: "input.mp4", plan: "edit-plan.json", transcript: "transcript.json", map: "timeline.json", subtitle: "captions.srt", base: baseVideo };
+  const styleProjectRelative = brief.styleProjectDir ? String(brief.styleProjectDir).replaceAll("\\", "/") : null;
+  const styleProjectDir = styleProjectRelative ? await workspacePath(root, styleProjectRelative) : null;
+  const styleMode = Boolean(styleProjectDir);
+  let styleProjectHash = null;
+  if (styleMode) {
+    if (!brief.stylePackId || !Number.isInteger(Number(brief.styleVersion)) || !brief.styleProjectHash) throw new Error("StyleProject 配置缺少 stylePackId/styleVersion/styleProjectHash");
+    const manifest = validateStyleManifest(JSON.parse(await fs.readFile(join(styleProjectDir, "style-manifest.json"), "utf8")));
+    if (manifest.id !== brief.stylePackId || manifest.version !== Number(brief.styleVersion)) throw new Error("StyleProject manifest 与当前项目风格版本不一致");
+    styleProjectHash = await hashStyleProject(styleProjectDir);
+    if (styleProjectHash !== brief.styleProjectHash) throw new Error("StyleProject 内容哈希已变化，请重新审批风格包");
+  }
+  const referenceAnalysis = styleMode
+    ? JSON.parse(await fs.readFile(await workspacePath(root, brief.referenceAnalysisPath || "reference-analysis.json"), "utf8"))
+    : null;
+  const captionCues = parseWhisperSrt(captions);
+  const renderedCaptionCues = styleMode
+    ? regroupCaptionCues(captionCues, brief.styleApplication?.captionPolicy?.wordsPerCue)
+    : captionCues;
+  const layoutEvents = styleMode ? mapLayoutEvents(plan.layoutEvents, pieces) : [];
+  const sourceFiles = {
+    source: "input.mp4",
+    plan: "edit-plan.json",
+    transcript: "transcript.json",
+    map: "timeline.json",
+    subtitle: "captions.srt",
+    base: baseVideo,
+    ...(styleProjectRelative ? {
+      styleManifest: `${styleProjectRelative}/style-manifest.json`,
+      referenceAnalysis: brief.referenceAnalysisPath || "reference-analysis.json",
+    } : {}),
+  };
   const hashes = {};
   for (const [key, name] of Object.entries(sourceFiles)) hashes[key] = await fileHash(await workspacePath(root, name));
+  let styleApplicationEvidence = null;
+  let styleProvenance = null;
+  if (styleMode) {
+    if (!brief.styleManifestSha256 || hashes.styleManifest !== brief.styleManifestSha256) throw new Error("StyleProject manifest 哈希与已审批 StylePack 不一致");
+    styleApplicationEvidence = {
+      parameters: brief.styleApplication?.parameters || brief.styleCopy || null,
+      captionPolicy: brief.styleApplication?.captionPolicy || null,
+      styleParameters: plan.styleParameters || brief.styleParameters || {},
+      captionStyle,
+      layoutEvents,
+    };
+    styleProvenance = {
+      stylePackId: brief.stylePackId,
+      styleVersion: Number(brief.styleVersion),
+      styleManifestSha256: hashes.styleManifest,
+      styleProjectHash,
+      referenceAnalysisSha256: hashes.referenceAnalysis,
+      styleApplicationSha256: valueHash(styleApplicationEvidence),
+    };
+  }
   const prefix = `remotion-main-${randomUUID()}`;
   const outputDir = await workspacePath(root, prefix, { existing: false });
   await fs.mkdir(outputDir);
   try {
     const sources = [];
-    for (const name of ["src/Overlay.jsx", "src/Root.jsx", "src/index.jsx", "src/render.mjs", "package.json"]) {
-      const target = join(outputDir, name);
-      await fs.mkdir(dirname(target), { recursive: true });
-      await fs.copyFile(join(runtimeRoot, name), target, fs.constants.COPYFILE_EXCL);
-      sources.push({ path: relative(root, target), sha256: await fileHash(target) });
-    }
-    const paths = { outputPath: `${prefix}/main.mp4`, overlayPath: `${prefix}/overlay.mov`, inputPath: `${prefix}/render-input.json`, receiptPath: `${prefix}/composition.json` };
+    if (!styleMode) for (const name of ["src/Overlay.jsx", "src/Root.jsx", "src/index.jsx", "src/render.mjs", "package.json"]) {
+        const target = join(outputDir, name);
+        await fs.mkdir(dirname(target), { recursive: true });
+        await fs.copyFile(join(runtimeRoot, name), target, fs.constants.COPYFILE_EXCL);
+        sources.push({ path: relative(root, target), sha256: await fileHash(target) });
+      }
+    const paths = { outputPath: `${prefix}/main.mp4`, overlayPath: `${prefix}/overlay.mov`, inputPath: `${prefix}/render-input.json`, receiptPath: `${prefix}/composition.json`, ...(styleMode ? { styleQcPath: `${prefix}/style-qc.json` } : {}) };
     const timeline = { contract: "timeline.v1", media: { width: probe.width, height: probe.height, fps: probe.fps, durationMs: probe.videoDurationMs }, visualEvents: events };
     await fs.writeFile(join(root, paths.inputPath), JSON.stringify({ ...timeline.media, events, pieces, captionStyle }, null, 2), { flag: "wx" });
     hashes.input = await fileHash(join(root, paths.inputPath));
-    const overlay = await renderRemotionOverlay({ timeline, outputPath: join(root, paths.overlayPath), workDir: outputDir });
-    const output = await compositeRemotionPreview({ inputPath: basePath, overlayPath: join(root, paths.overlayPath), outputPath: join(root, paths.outputPath), subtitlePath: await workspacePath(root, "captions.srt"), captionStyle, durationMs: probe.videoDurationMs, phase });
+    const overlay = styleMode
+      ? await renderStyleProject({
+          projectDir: styleProjectDir,
+          compositionId: brief.styleCompositionId || "ReferenceStyle",
+          outputPath: join(root, paths.overlayPath),
+          props: {
+            width: probe.width,
+            height: probe.height,
+            fps: probe.fps,
+            durationMs: probe.videoDurationMs,
+            captions: renderedCaptionCues,
+            visualEvents: events,
+            layoutEvents,
+            styleParams: plan.styleParameters || brief.styleParameters || {},
+            captionStyle,
+            styleSpec: referenceAnalysis?.styleSpec || null,
+          },
+        })
+      : await renderRemotionOverlay({ timeline, outputPath: join(root, paths.overlayPath), workDir: outputDir });
+    const output = await compositeRemotionPreview({
+      inputPath: basePath,
+      overlayPath: join(root, paths.overlayPath),
+      outputPath: join(root, paths.outputPath),
+      subtitlePath: styleMode ? null : await workspacePath(root, "captions.srt"),
+      captionStyle,
+      layoutEvents: styleMode ? layoutEvents : [],
+      durationMs: probe.videoDurationMs,
+      phase,
+    });
     const finalProbe = await probeOutput(output.outputPath);
     const black = await detectBlackFrames(output.outputPath);
-    if (Math.abs(finalProbe.videoDurationMs - probe.videoDurationMs) > 1000 / probe.fps + 1 || finalProbe.width !== probe.width || finalProbe.height !== probe.height || finalProbe.avSyncDeltaMs === null || finalProbe.avDurationDeltaMs === null || finalProbe.avSyncDeltaMs > 250 || finalProbe.avDurationDeltaMs > 250 || black.length) throw new Error("Remotion 主视频未通过画幅、时长、音画同步或黑帧检查");
+    if (Math.abs(finalProbe.videoDurationMs - probe.videoDurationMs) > 1000 / probe.fps + 1 || finalProbe.width !== probe.width || finalProbe.height !== probe.height || finalProbe.avSyncDeltaMs === null || finalProbe.avDurationDeltaMs === null || finalProbe.avSyncDeltaMs > 250 || finalProbe.avDurationDeltaMs > 250 || black.length) {
+      throw new Error(`Remotion 主视频未通过画幅、时长、音画同步或黑帧检查：${JSON.stringify({
+        expected: { width: probe.width, height: probe.height, videoDurationMs: probe.videoDurationMs, fps: probe.fps },
+        actual: { width: finalProbe.width, height: finalProbe.height, videoDurationMs: finalProbe.videoDurationMs, avSyncDeltaMs: finalProbe.avSyncDeltaMs, avDurationDeltaMs: finalProbe.avDurationDeltaMs },
+        blackFrames: black.length,
+      })}`);
+    }
+    let styleQc = null;
+    let styleQcSha256 = null;
+    if (styleMode) {
+      let assetsDoc = { broll: [], music: null };
+      try {
+        assetsDoc = JSON.parse(await fs.readFile(await workspacePath(root, "assets.json"), "utf8"));
+      } catch {
+        // Fixture workspaces without B-roll or music still have a positive empty license set.
+      }
+      const assetsLicensed = (assetsDoc.broll || []).every((asset) => asset.licenseConfirmed === true)
+        && (!assetsDoc.music || assetsDoc.music.licenseConfirmed === true);
+      let faceFrames = [];
+      let faceDetectionAvailable = true;
+      try {
+        faceFrames = await detectFaceFrames(output.outputPath, { maxSamples: 12 });
+      } catch {
+        faceDetectionAvailable = false;
+      }
+      styleQc = await evaluateStyleQc({
+        referenceAnalysis,
+        userFacts: deriveUserStyleFacts({ plan, transcript: { segments: renderedCaptionCues }, media: { width: probe.width, height: probe.height, durationMs: finalProbe.durationMs } }),
+        render: {
+          probe: finalProbe,
+          blackFrames: black,
+          inputHashes: [hashes.source, ...(assetsDoc.broll || []).map((asset) => asset.sha256).filter(Boolean)],
+          assetsLicensed,
+          styleProjectHash,
+        },
+        expectedStyleProjectHash: styleProjectHash,
+        captions: renderedCaptionCues,
+        captionStyle,
+        faceFrames,
+        faceDetectionAvailable,
+        requireFaceEvidence: brief.styleQc?.requireFaceEvidence === true,
+        copy: brief.styleApplication?.parameters || brief.styleCopy || {},
+      });
+      styleQc = { ...styleQc, styleProvenance };
+      styleQcSha256 = await writeStyleQc(join(root, paths.styleQcPath), styleQc);
+      if (!styleQc.passed) throw new Error(`风格 QC 未通过：${styleQc.issues.map((issue) => issue.metric).join(", ") || Object.entries(styleQc.hardGates).filter(([, gate]) => !gate.passed).map(([name]) => name).join(", ")}`);
+    }
     for (const [key, name] of Object.entries(sourceFiles)) if (await fileHash(await workspacePath(root, name)) !== hashes[key]) throw new Error("合成期间输入发生变化，请重试");
     // Cross-phase identity follows editorial meaning; current-run byte hashes
     // still bind every file above, including formatting and provider metadata.
@@ -125,9 +265,10 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
       broll: (plan.brollEvents || []).map(({ id, assetId, startMs, endMs, sourceStartMs }) => ({ id, assetId, startMs, endMs, sourceStartMs })),
       captionCoverage: (plan.captionCoverage || []).map(({ eventId, startMs, endMs, text }) => ({ eventId, startMs, endMs, text })),
       captionStyle,
+      style: styleMode ? { ...styleProvenance, styleProjectDir: styleProjectRelative, layoutEvents } : null,
       sources: sources.map((source) => source.sha256),
     });
-    const result = { compositionMode: REMOTION_MAIN_MODE, phase, ...paths, sourceFiles, sources, events, pieces, captionStyle, width: probe.width, height: probe.height, fps: probe.fps, durationMs: finalProbe.durationMs, videoDurationMs: finalProbe.videoDurationMs, remotionVersion: overlay.remotionVersion, designSha256, sha256: { ...hashes, output: output.sha256, overlay: overlay.sha256 }, qc: { passed: true, alpha: overlay.alpha, audioVideoSyncDeltaMs: finalProbe.avSyncDeltaMs, audioVideoDurationDeltaMs: finalProbe.avDurationDeltaMs, blackFrameCount: 0 } };
+    const result = { compositionMode: REMOTION_MAIN_MODE, phase, ...paths, sourceFiles, sources, events, layoutEvents, pieces, captionStyle, stylePackId: styleMode ? brief.stylePackId : null, styleVersion: styleMode ? Number(brief.styleVersion) : null, styleProjectHash, styleProjectDir: styleProjectRelative, styleProvenance, styleApplicationEvidence, captionMode: styleMode ? "style-project" : "ffmpeg-srt", width: probe.width, height: probe.height, fps: probe.fps, durationMs: finalProbe.durationMs, videoDurationMs: finalProbe.videoDurationMs, remotionVersion: overlay.remotionVersion, designSha256, sha256: { ...hashes, output: output.sha256, overlay: overlay.sha256, ...(styleQcSha256 ? { styleQc: styleQcSha256 } : {}) }, styleQcSha256, qc: { passed: true, alpha: overlay.alpha, isolation: overlay.isolation || null, networkIsolated: overlay.networkIsolated === true, audioVideoSyncDeltaMs: finalProbe.avSyncDeltaMs, audioVideoDurationDeltaMs: finalProbe.avDurationDeltaMs, blackFrameCount: 0, styleQc: styleQc ? { contract: styleQc.contract, passed: styleQc.passed, metrics: styleQc.metrics, issues: styleQc.issues, hardGates: styleQc.hardGates } : null } };
     await fs.writeFile(join(root, paths.receiptPath), JSON.stringify(result, null, 2), { flag: "wx" });
     return { ...result, receiptSha256: await fileHash(join(root, paths.receiptPath)) };
   } catch (error) {
@@ -149,7 +290,25 @@ export async function validateRemotionComposition({ dir, phase, manifest, audit,
   await check(record.overlayPath, record.sha256.overlay);
   await check(record.inputPath, record.sha256.input);
   await check(record.receiptPath, record.receiptSha256);
+  if (record.stylePackId) {
+    if (!record.styleQcPath || !record.styleQcSha256 || record.qc?.styleQc?.passed !== true) throw new Error("StylePack 缺少通过门禁的 style-qc 证据");
+    if (record.qc?.isolation !== "bwrap-network-namespace" || record.qc?.networkIsolated !== true) throw new Error("StyleProject 缺少 bwrap 网络隔离证据");
+    const provenance = record.styleProvenance;
+    if (!provenance
+      || provenance.stylePackId !== record.stylePackId
+      || Number(provenance.styleVersion) !== Number(record.styleVersion)
+      || provenance.styleProjectHash !== record.styleProjectHash
+      || typeof provenance.styleManifestSha256 !== "string"
+      || typeof provenance.referenceAnalysisSha256 !== "string"
+      || typeof provenance.styleApplicationSha256 !== "string"
+      || provenance.styleManifestSha256 !== record.sha256?.styleManifest
+      || provenance.referenceAnalysisSha256 !== record.sha256?.referenceAnalysis
+      || valueHash(record.styleApplicationEvidence) !== provenance.styleApplicationSha256) throw new Error("StyleProject 渲染来源证据不完整或已变化");
+    await check(record.styleQcPath, record.styleQcSha256);
+    const styleDir = await workspacePath(dir, record.styleProjectDir);
+    if (await hashStyleProject(styleDir) !== provenance.styleProjectHash) throw new Error("style project hash mismatch; style pack is stale");
+  }
   for (const source of record.sources) await check(source.path, source.sha256);
-  const files = [{ path: record.overlayPath, kind: "render-layer", engine: "remotion" }, { path: record.inputPath, kind: "render-input", engine: "remotion" }, { path: record.receiptPath, kind: "composition-record", engine: "remotion" }, ...record.sources.map((source) => ({ path: source.path, kind: "source", engine: "remotion" }))];
+  const files = [{ path: record.overlayPath, kind: "render-layer", engine: "remotion" }, { path: record.inputPath, kind: "render-input", engine: "remotion" }, ...(record.styleQcPath ? [{ path: record.styleQcPath, kind: "style-qc", engine: "remotion" }] : []), { path: record.receiptPath, kind: "composition-record", engine: "remotion" }, ...record.sources.map((source) => ({ path: source.path, kind: "source", engine: "remotion" }))];
   return { files, record };
 }

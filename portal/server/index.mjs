@@ -5,13 +5,13 @@ import { constants as fsConstants, createReadStream, createWriteStream } from "n
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
-import { extname, join, resolve } from "node:path";
+import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { providerState, transcribeVideo } from "./transcription.mjs";
 import { getWhisperConfig } from "./local-whisper.mjs";
 import { REMOTION_MAIN_MODE } from "./remotion-main.mjs";
 import { createProjectStore } from "./project-store.mjs";
-import { writeTranscriptArtifacts } from "./edit-plan.mjs";
+import { normalizeCaptionStyle, protectTranscriptCorrections, writeTranscriptArtifacts } from "./edit-plan.mjs";
 import { applyTranscriptReview, ensureTranscriptReviewState } from "./transcript-review.mjs";
 import { subtitlesMatchTranscript, transcriptFingerprint } from "./transcript-proofreading.mjs";
 import { editWithClaudeCode, editorState } from "./claude-code-editor.mjs";
@@ -28,11 +28,20 @@ import { confirmMultiAssetPlan, planMultiAssetWithClaude, restoreMultiAssetPlan 
 import { renderMultiAssetProject } from "./multi-asset-render.mjs";
 import { sanitizePublicResponse } from "./public-error.mjs";
 import { recoverInterruptedMultiAssetProject } from "./multi-asset-recovery.mjs";
+import { analyzeReference, normalizeReferenceAnalysis } from "./reference-analysis.mjs";
+import { generateStyleProject } from "./style-generator.mjs";
+import { approveStylePack, assertStylePackCompatible, loadStylePack, rejectStylePack, saveStylePack } from "./style-pack-store.mjs";
+import { applyStyleToWorkflow, normalizeStyleCopy, regroupCaptionCues, styleAssetsForProject } from "./style-application.mjs";
+import { renderStyleProject } from "./style-renderer.mjs";
+import { hashStyleProject } from "./style-project.mjs";
+import { assertReferenceStyleCapability, assertStyleExportAllowed, referenceStyleConfig } from "./style-rollout.mjs";
+import { runReferenceStyleAgent } from "./reference-style-editor.mjs";
+import { REFERENCE_MIN_SECONDS, deleteWechatSource, ingestWechatSource, pruneWechatSources, readWechatSource, resolveWechatLink, trimReferenceClip } from "./wechat-ingest.mjs";
 
 try {
   if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
   const envText = await fs.readFile(new URL("../.env", import.meta.url), "utf8");
-  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE", "WAYNE_WHISPER_CLI_PATH", "WAYNE_WHISPER_MODEL_PATH", "WAYNE_WHISPER_THREADS", "WAYNE_WHISPER_TIMEOUT_MS"]);
+  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE", "WAYNE_WHISPER_CLI_PATH", "WAYNE_WHISPER_MODEL_PATH", "WAYNE_WHISPER_THREADS", "WAYNE_WHISPER_TIMEOUT_MS", "REFERENCE_STYLE_ENABLED", "REFERENCE_STYLE_STAGE", "REFERENCE_STYLE_VISUAL_ANALYSIS", "REFERENCE_STYLE_AUDIO_ANALYSIS", "REFERENCE_ANALYSIS_MODEL", "REFERENCE_ANALYSIS_TIMEOUT_MS", "WAYNE_AUDIO_ANALYSIS_PYTHON", "WAYNE_STYLE_DIR", "WAYNE_STYLE_GENERATOR", "WAYNE_STYLE_AGENT", "WAYNE_FACE_DETECTOR_PYTHON", "REMOTION_BROWSER_EXECUTABLE"]);
   for (const line of envText.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
     if (match && portalKeys.has(match[1])) process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
@@ -41,6 +50,8 @@ try {
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const store = createProjectStore(resolve(process.env.WAYNE_STORAGE_DIR || join(root, "storage")));
+const referenceStylesRoot = join(store.root, "reference-styles");
+const styleLibraryRoot = resolve(process.env.WAYNE_STYLE_DIR || join(root, "style-library"));
 const subscribers = new Map();
 const brollSearchRequests = new Map();
 const activeTranscriptions = new Set();
@@ -48,6 +59,8 @@ const activeAssetAnalyses = new Set();
 const assetUploadLocks = new Map();
 const editorRuntime = editorState();
 const engineAvailability = getEngineAvailability({ remotion: await remotionRuntimeAvailable() });
+const referenceStyleRollout = referenceStyleConfig();
+const styleAgentEngine = process.env.WAYNE_STYLE_AGENT || "claude-code";
 let openchatcutAvailability = { ...engineAvailability.openchatcut };
 await store.loadProjects();
 
@@ -62,6 +75,16 @@ function json(res, status, body) {
   res.end(JSON.stringify(sanitizePublicResponse(body)));
 }
 
+function rejectMissingStyleCapability(res, capability) {
+  try {
+    assertReferenceStyleCapability(referenceStyleRollout, capability);
+    return false;
+  } catch (error) {
+    json(res, error.statusCode || 403, { error: error.message });
+    return true;
+  }
+}
+
 function isLoopbackClient(req) {
   const address = String(req.socket.remoteAddress || "").replace(/^::ffff:/i, "").split("%")[0];
   if (address === "::1") return true;
@@ -70,7 +93,7 @@ function isLoopbackClient(req) {
 }
 
 function isLoopbackPortalRequest(req) {
-  if (!isLoopbackClient(req) || req.headers["x-forwarded-for"]) return false;
+  if (!isLoopbackClient(req) || req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.headers.forwarded) return false;
   const isLocalUrl = (value) => {
     if (!value) return true;
     try { return ["localhost", "127.0.0.1", "::1"].includes(new URL(value).hostname.replace(/^\[|\]$/g, "")); }
@@ -85,6 +108,42 @@ async function sha256File(path) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
+}
+
+function valueHash(value) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function styleRenderEvidence(application, plan, workflowMode) {
+  const layoutEvents = workflowMode === "multi-asset-v1"
+    ? (plan?.clips || []).filter((clip) => clip.track === "video-main").map((clip, index) => ({
+        id: `multi-layout-${index + 1}`,
+        type: clip.layout?.type || "full",
+        startMs: Number(clip.timelineStartMs),
+        endMs: Number(clip.timelineEndMs),
+        params: {},
+      }))
+    : plan?.layoutEvents || [];
+  const captionStyle = workflowMode === "multi-asset-v1"
+    ? plan?.captionStyle || { fontSize: 38, marginV: 120, outline: 2, color: "#ffffff" }
+    : normalizeCaptionStyle(plan?.captionStyle);
+  return {
+    parameters: application?.parameters || null,
+    captionPolicy: application?.captionPolicy || null,
+    styleParameters: plan?.styleParameters || {},
+    captionStyle,
+    layoutEvents,
+  };
+}
+
+function runProcess(command, args, cwd = root) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolveRun() : reject(new Error(`${command} failed (${code}): ${stderr.slice(-2000)}`)));
+  });
 }
 
 function configState() {
@@ -103,6 +162,7 @@ function configState() {
     ffmpeg: true,
     engines: availableEngines(),
     brollProviders: brollProviderState(),
+    referenceStyle: { ...referenceStyleRollout, engine: styleAgentEngine },
     mode: allConfigured ? "configured" : anthropic || transcription.any ? "partial" : "demo",
   };
 }
@@ -117,6 +177,8 @@ function projectView(project) {
     workflowMode: normalizeWorkflowMode(project.workflowMode),
     multiAssetPlan: project.multiAssetPlan ? { ...project.multiAssetPlan } : null,
     multiAssetPreview: project.multiAssetPreview ? { ...project.multiAssetPreview } : null,
+    stylePack: project.stylePack ? publicStylePack(project.stylePack) : null,
+    styleProjectPath: undefined,
     dir: undefined,
     media,
     music,
@@ -125,6 +187,186 @@ function projectView(project) {
     config: configState(),
     artifacts: (project.artifacts || []).map((artifact) => ({ ...artifact, url: `/api/projects/${project.id}/artifacts/${encodeURIComponent(artifact.name)}`, streamUrl: `/media/${project.id}/artifacts/${encodeURIComponent(artifact.name)}` })),
   });
+}
+
+function publicStylePack(stylePack) {
+  if (!stylePack) return null;
+  const { dir: _dir, styleProjectDir: _projectDir, ...rest } = stylePack;
+  return sanitizePublicResponse({ ...rest, dir: undefined, styleProjectDir: undefined });
+}
+
+function safeReferenceDir(id) {
+  if (!/^[a-f0-9-]{36}$/i.test(String(id || ""))) throw Object.assign(new Error("reference style not found"), { statusCode: 404 });
+  const target = resolve(referenceStylesRoot, id);
+  if (!target.startsWith(`${resolve(referenceStylesRoot)}${sep}`)) throw Object.assign(new Error("reference style not found"), { statusCode: 404 });
+  return target;
+}
+
+async function analyzeReferenceVideo({ id, dir, videoPath, filename, contentType, mode, referenceUsageConfirmedAt, sourceTrim = null }) {
+  let analysis;
+  let stylePack = null;
+  if (styleAgentEngine === "claude-code") {
+    if (!editorRuntime.available) throw Object.assign(new Error("Claude Code 或 bwrap 不可用，无法执行 reference-style agent"), { statusCode: 503 });
+    const result = await runReferenceStyleAgent({
+      referenceId: id,
+      videoPath,
+      workDir: dir,
+      mode,
+      sourceFilename: filename,
+      referenceUsageConfirmedAt,
+      styleRoot: styleLibraryRoot,
+    });
+    analysis = result.analysis;
+    stylePack = result.stylePack;
+  } else {
+    analysis = await analyzeReference({ videoPath, workDir: dir, mode, sourceFilename: filename });
+  }
+  await fs.writeFile(join(dir, "analysis.json"), JSON.stringify({
+    id,
+    originalFilename: filename,
+    contentType,
+    mode,
+    referenceUsageConfirmedAt,
+    ...(sourceTrim ? { sourceTrim } : {}),
+    analysis,
+  }, null, 2));
+  return { analysis, stylePack };
+}
+
+async function readReferenceStyle(id) {
+  const dir = safeReferenceDir(id);
+  try {
+    const stored = JSON.parse(await fs.readFile(join(dir, "analysis.json"), "utf8"));
+    const analysis = normalizeReferenceAnalysis(stored.analysis || stored);
+    return {
+      id,
+      dir,
+      analysis,
+      referenceUsageConfirmedAt: stored.referenceUsageConfirmedAt || null,
+      contentType: referenceContentType(stored.contentType, stored.originalFilename || analysis.source?.filename),
+    };
+  } catch (error) {
+    if (error.code === "ENOENT") throw Object.assign(new Error("reference style not found"), { statusCode: 404 });
+    throw error;
+  }
+}
+
+function referenceContentType(provided, filename) {
+  const type = String(provided || "").toLowerCase().split(";")[0].trim();
+  if (["video/mp4", "video/quicktime", "video/webm"].includes(type)) return type;
+  const extension = String(filename || "").toLowerCase().match(/\.[^.]+$/)?.[0];
+  if (extension === ".mov") return "video/quicktime";
+  if (extension === ".webm") return "video/webm";
+  return "video/mp4";
+}
+
+async function findReferenceByAnalysisId(analysisId) {
+  const entries = await fs.readdir(referenceStylesRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[a-f0-9-]{36}$/i.test(entry.name)) continue;
+    try {
+      const stored = JSON.parse(await fs.readFile(join(referenceStylesRoot, entry.name, "analysis.json"), "utf8"));
+      const analysis = stored.analysis || stored;
+      if (analysis.analysisId === analysisId) {
+        return {
+          id: entry.name,
+          dir: join(referenceStylesRoot, entry.name),
+          analysis,
+          referenceUsageConfirmedAt: stored.referenceUsageConfirmedAt || null,
+        };
+      }
+    } catch {
+      // Ignore incomplete or malformed reference directories.
+    }
+  }
+  return null;
+}
+
+function applyStyleSelectionToProject(project, {
+  pack,
+  reference,
+  styleCopy = project.styleCopy,
+  applyPlans = true,
+  bumpPlanVersion = false,
+  sourcePlan = project.plan,
+  sourceMultiAssetPlan = project.multiAssetPlan,
+} = {}) {
+  if (!pack || !reference?.analysis) throw new Error("已审批 StylePack 和来源分析均为必填");
+  const workflowMode = project.workflowMode || "single-video-v1";
+  const selection = applyStyleToWorkflow({
+    stylePack: pack,
+    referenceAnalysis: reference.analysis,
+    workflowMode,
+    transcript: project.transcript || null,
+    media: project.media || null,
+    assets: styleAssetsForProject(project),
+    brief: { ...(project.brief || {}), styleCopy },
+    plan: applyPlans ? sourcePlan : null,
+    multiAssetPlan: applyPlans ? sourceMultiAssetPlan : null,
+  });
+  if (applyPlans && workflowMode === "single-video-v1") project.plan = selection.plan;
+  if (applyPlans && workflowMode === "multi-asset-v1") {
+    const previous = project.multiAssetPlan;
+    if (previous && selection.multiAssetPlan) {
+      const history = project.multiAssetPlanHistory || [];
+      if (!history.some((item) => Number(item.version) === Number(previous.version))) {
+        project.multiAssetPlanHistory = [...history, previous];
+      }
+    }
+    project.multiAssetPlan = previous && bumpPlanVersion
+      ? {
+          ...selection.multiAssetPlan,
+          confirmed: false,
+          version: Number(previous.version || 1) + 1,
+          generatedAt: new Date().toISOString(),
+        }
+      : selection.multiAssetPlan;
+    if (previous) {
+      project.multiAssetPreview = null;
+      project.multiAssetPreviewReview = null;
+    }
+  }
+  const activePlan = workflowMode === "multi-asset-v1" ? project.multiAssetPlan : project.plan;
+  project.stylePack = pack;
+  project.stylePackId = pack.id;
+  project.styleVersion = pack.version;
+  project.referenceStyleId = reference.id;
+  project.referenceAnalysis = reference.analysis;
+  project.styleCopy = { ...selection.application.parameters };
+  project.styleApplication = {
+    parameters: { ...selection.application.parameters },
+    captionPolicy: { ...selection.application.captionPolicy },
+    warnings: [...(selection.application.warnings || [])],
+    unsupported: [...(selection.application.unsupported || [])],
+  };
+  project.styleParameters = { ...selection.application.styleParameters };
+  project.styleApplicationHash = activePlan
+    ? valueHash(styleRenderEvidence(project.styleApplication, activePlan, workflowMode))
+    : null;
+  project.styleProjectPath = pack.styleProjectDir;
+  project.style = pack.manifest.name;
+  project.error = null;
+  return selection;
+}
+
+async function listStoredStylePacks() {
+  const stylesDir = join(styleLibraryRoot, "styles");
+  const entries = await fs.readdir(stylesDir, { withFileTypes: true }).catch(() => []);
+  const packs = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const versions = await fs.readdir(join(stylesDir, entry.name), { withFileTypes: true }).catch(() => []);
+    for (const versionEntry of versions) {
+      const match = versionEntry.isDirectory() && versionEntry.name.match(/^v(\d+)$/);
+      if (!match) continue;
+      try { packs.push(publicStylePack(await loadStylePack(entry.name, Number(match[1]), { root: styleLibraryRoot }))); } catch { /* Ignore incomplete packs. */ }
+    }
+  }
+  return packs.sort((a, b) => String(a.id).localeCompare(String(b.id)) || Number(a.version) - Number(b.version));
+}
+
+async function fixtureStyleRunner({ projectDir }) {
+  await fs.appendFile(join(projectDir, "src", "StyleOverlay.tsx"), "\n// fixture style generation\n");
 }
 
 function projectSummary(project) {
@@ -373,9 +615,11 @@ function parseMultipart(req, boundary, destination, maxBytes = 500 * 1024 * 1024
         await fs.writeFile(destination, filePart.content);
         resolveUpload({
           filename: filePart.header.match(/filename="([^"]+)/i)?.[1] || "upload.mp4",
+          contentType: filePart.header.match(/content-type:\s*([^\r\n]+)/i)?.[1]?.trim() || "",
           goal: parts.find((part) => /name="goal"/i.test(part.header))?.content.toString("utf8") || "",
           style: parts.find((part) => /name="style"/i.test(part.header))?.content.toString("utf8") || "",
           licenseConfirmed: parts.find((part) => /name="licenseConfirmed"/i.test(part.header))?.content.toString("utf8") === "true",
+          referenceUsageConfirmed: parts.find((part) => /name="referenceUsageConfirmed"/i.test(part.header))?.content.toString("utf8") === "true",
         });
       } catch (error) { reject(error); }
     });
@@ -482,6 +726,13 @@ async function transitionToPlan(project) {
     const result = await editWithClaudeCode(project, "plan", editorProgress(project), { persistProject: save });
     project.plan = result.plan;
     project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])];
+    if (project.stylePack) {
+      applyStyleSelectionToProject(project, {
+        pack: project.stylePack,
+        reference: { id: project.referenceStyleId, analysis: project.referenceAnalysis },
+        styleCopy: project.styleCopy,
+      });
+    }
     project.editor = result.editor;
     project.artifacts = [...(project.artifacts || []), ...result.artifacts];
     project.qc = null;
@@ -509,6 +760,13 @@ async function runChatEdit(project, turn) {
     const result = await editWithClaudeCode(project, "chat-edit", editorProgress(project), { chatTurn: turn, chatContext: buildChatContext(session), sessionId: session.sessionId });
     project.plan = result.plan;
     project.brollAssets = [...(project.brollAssets || []), ...(result.brollAssets || [])];
+    if (project.stylePack) {
+      applyStyleSelectionToProject(project, {
+        pack: project.stylePack,
+        reference: { id: project.referenceStyleId, analysis: project.referenceAnalysis },
+        styleCopy: project.styleCopy,
+      });
+    }
     project.editor = { ...result.editor, version: turn.resultVersion, phase: "chat-edit", sessionId: result.editor.sessionId || session.sessionId };
     project.artifacts = [...(project.artifacts || []), ...result.artifacts];
     project.qc = result.qc;
@@ -554,6 +812,323 @@ async function handle(req, res) {
     } catch (error) {
       const message = error.message === "The operation was aborted due to timeout" ? "OpenChatCut 工程列表读取超时" : error.message;
       return json(res, 503, { error: message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/wechat-video/resolve") {
+    try {
+      const body = await readJson(req);
+      return json(res, 200, await resolveWechatLink(body.link));
+    } catch (error) {
+      return json(res, error.statusCode || 400, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/wechat-video/ingest") {
+    try {
+      const body = await readJson(req);
+      const source = await ingestWechatSource({ link: body.link, storageRoot: store.root, mode: body.mode || "single-video-v1" });
+      return json(res, 201, source);
+    } catch (error) {
+      return json(res, error.statusCode || 400, { error: error.message });
+    }
+  }
+  if (req.method === "GET" && segments[0] === "api" && segments[1] === "wechat-video" && segments[2] === "sources" && segments[3] && segments[4] === "media") {
+    try {
+      const source = await readWechatSource(store.root, segments[3]);
+      return await serveFile(req, res, source.path, "video/mp4");
+    } catch (error) {
+      return json(res, error.statusCode || 404, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/reference-styles") {
+    if (rejectMissingStyleCapability(res, "analyze")) return;
+    const id = randomUUID();
+    const dir = safeReferenceDir(id);
+    const headerType = String(req.headers["content-type"] || "");
+    const isJson = /application\/json/i.test(headerType);
+    const boundaryMatch = headerType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+    const boundary = boundaryMatch?.[1] || boundaryMatch?.[2] || "";
+    if (!isJson && !boundary) return json(res, 400, { error: "multipart boundary is required" });
+    try {
+      if (isJson) {
+        // 视频号链接导入：先把链接下载成临存 source，再把文件接入同一条分析流水线。
+        const body = await readJson(req);
+        if (body.referenceUsageConfirmed !== true) throw new Error("请先确认你拥有参考视频的分析和使用许可");
+        const mode = String(body.mode || "single-video-v1");
+        if (!["single-video-v1", "multi-asset-v1"].includes(mode)) throw new Error("reference mode is invalid");
+        const source = await readWechatSource(store.root, String(body.sourceId || ""));
+        const durationSeconds = Number(source.durationSeconds || 0);
+        if (durationSeconds && durationSeconds < REFERENCE_MIN_SECONDS) {
+          throw Object.assign(new Error(`参考视频需要至少 ${REFERENCE_MIN_SECONDS} 秒，这条只有 ${Math.round(durationSeconds)} 秒`), { statusCode: 422 });
+        }
+        await fs.mkdir(dir, { recursive: true });
+        const videoPath = join(dir, "reference.mp4");
+        await fs.copyFile(source.path, videoPath);
+        // 超过 180 秒的素材按需截取，分析范围与原始时长都写进 analysis.json。
+        const sourceTrim = await trimReferenceClip({ filePath: videoPath, durationSeconds, startSeconds: Number(body.trimStartSeconds || 0) });
+        const { analysis, stylePack } = await analyzeReferenceVideo({
+          id,
+          dir,
+          videoPath,
+          filename: source.filename || "wechat-video.mp4",
+          contentType: source.contentType || "video/mp4",
+          mode,
+          referenceUsageConfirmedAt: new Date().toISOString(),
+          sourceTrim,
+        });
+        await deleteWechatSource(store.root, source.id).catch(() => undefined);
+        return json(res, 201, { id, analysis, ...(sourceTrim ? { sourceTrim } : {}), ...(stylePack ? { stylePack: publicStylePack(stylePack) } : {}) });
+      }
+      await fs.mkdir(dir, { recursive: true });
+      const videoPath = join(dir, "reference.mp4");
+      const upload = await parseMultipart(req, boundary, videoPath, 200 * 1024 * 1024);
+      if (!upload.referenceUsageConfirmed) throw new Error("请先确认你拥有参考视频的分析和使用许可");
+      const mode = String(url.searchParams.get("mode") || "single-video-v1");
+      if (!["single-video-v1", "multi-asset-v1"].includes(mode)) throw new Error("reference mode is invalid");
+      const contentType = referenceContentType(upload.contentType, upload.filename);
+      const { analysis, stylePack } = await analyzeReferenceVideo({
+        id,
+        dir,
+        videoPath,
+        filename: upload.filename,
+        contentType,
+        mode,
+        referenceUsageConfirmedAt: new Date().toISOString(),
+      });
+      return json(res, 201, { id, analysis, ...(stylePack ? { stylePack: publicStylePack(stylePack) } : {}) });
+    } catch (error) {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      return json(res, error.statusCode || 400, { error: error.message });
+    }
+  }
+  if (req.method === "GET" && segments[0] === "api" && segments[1] === "reference-styles" && segments[2] && segments.length === 3) {
+    if (rejectMissingStyleCapability(res, "analyze")) return;
+    try {
+      const reference = await readReferenceStyle(segments[2]);
+      return json(res, 200, {
+        id: reference.id,
+        analysis: reference.analysis,
+        referenceUsageConfirmedAt: reference.referenceUsageConfirmedAt,
+      });
+    } catch (error) {
+      return json(res, error.statusCode || 404, { error: error.message });
+    }
+  }
+  if (req.method === "GET" && segments[0] === "api" && segments[1] === "reference-styles" && segments[2] && segments[3] === "media" && segments.length === 4) {
+    if (rejectMissingStyleCapability(res, "analyze")) return;
+    try {
+      const reference = await readReferenceStyle(segments[2]);
+      return await serveFile(req, res, join(reference.dir, "reference.mp4"), reference.contentType);
+    } catch (error) {
+      return json(res, error.statusCode || 404, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && segments[0] === "api" && segments[1] === "reference-styles" && segments[3] === "generate" && segments.length === 4) {
+    if (rejectMissingStyleCapability(res, "manage")) return;
+    if (!isLoopbackPortalRequest(req)) return json(res, 403, { error: "StylePack 生成仅允许本机管理员操作" });
+    try {
+      const reference = await readReferenceStyle(segments[2]);
+      if (!reference.referenceUsageConfirmedAt) return json(res, 409, { error: "参考视频缺少分析和使用许可确认，请重新上传" });
+      const existing = (await listStoredStylePacks())
+        .filter((pack) => pack.manifest?.sourceAnalysisId === reference.analysis.analysisId)
+        .sort((a, b) => Number(a.version) - Number(b.version));
+      const latest = existing.at(-1);
+      const manifest = latest ? {
+        ...latest.manifest,
+        version: Number(latest.version) + 1,
+        status: "draft",
+        preview: null,
+      } : null;
+      const outDir = join(reference.dir, "style-projects", randomUUID());
+      await fs.mkdir(dirname(outDir), { recursive: true });
+      const styleProject = await generateStyleProject({
+        analysis: reference.analysis,
+        manifest,
+        outDir,
+        claudeRunner: process.env.WAYNE_STYLE_GENERATOR === "fixture" ? fixtureStyleRunner : undefined,
+      });
+      const pack = await saveStylePack({ root: styleLibraryRoot, manifest: styleProject.manifest, projectDir: styleProject.dir, status: "pending_approval" });
+      return json(res, 201, publicStylePack(pack));
+    } catch (error) {
+      return json(res, error.statusCode || 502, { error: error.message });
+    }
+  }
+  if (req.method === "GET" && url.pathname === "/api/style-packs") {
+    if (rejectMissingStyleCapability(res, "manage")) return;
+    const packs = await listStoredStylePacks();
+    return json(res, 200, { stylePacks: isLoopbackPortalRequest(req) ? packs : packs.filter((pack) => pack.status === "approved") });
+  }
+  if (req.method === "GET" && segments[0] === "api" && segments[1] === "style-packs" && segments[2] && segments[3] && segments.length === 4) {
+    if (rejectMissingStyleCapability(res, "manage")) return;
+    try {
+      const pack = await loadStylePack(segments[2], Number(segments[3]), { root: styleLibraryRoot });
+      if (!isLoopbackPortalRequest(req) && pack.status !== "approved") return json(res, 404, { error: "style pack not found" });
+      return json(res, 200, publicStylePack(pack));
+    } catch {
+      return json(res, 404, { error: "style pack not found" });
+    }
+  }
+  if (req.method === "POST" && segments[0] === "api" && segments[1] === "style-packs" && segments[2] && segments[3] && segments[4] === "approve" && segments.length === 5) {
+    if (rejectMissingStyleCapability(res, "manage")) return;
+    if (!isLoopbackPortalRequest(req)) return json(res, 403, { error: "StylePack 审批仅允许本机管理员操作" });
+    try {
+      const pack = await approveStylePack(segments[2], Number(segments[3]), { root: styleLibraryRoot });
+      return json(res, 200, publicStylePack(pack));
+    } catch (error) {
+      return json(res, /not found|ENOENT/i.test(error.message) ? 404 : 409, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && segments[0] === "api" && segments[1] === "style-packs" && segments[2] && segments[3] && segments[4] === "reject" && segments.length === 5) {
+    if (rejectMissingStyleCapability(res, "manage")) return;
+    if (!isLoopbackPortalRequest(req)) return json(res, 403, { error: "StylePack 审批仅允许本机管理员操作" });
+    try {
+      const body = await readJson(req);
+      const pack = await rejectStylePack(segments[2], Number(segments[3]), { root: styleLibraryRoot, reason: body.reason });
+      return json(res, 200, publicStylePack(pack));
+    } catch (error) {
+      return json(res, /not found|ENOENT/i.test(error.message) ? 404 : 409, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && segments[0] === "api" && segments[1] === "projects" && segments[2] && segments[3] === "apply-style" && segments.length === 4) {
+    if (rejectMissingStyleCapability(res, "apply")) return;
+    const targetProject = store.get(segments[2]);
+    if (!targetProject) return json(res, 404, { error: "project not found" });
+    try {
+      const body = await readJson(req);
+      const stylePackId = String(body.stylePackId || "");
+      const version = Number(body.version || 1);
+      const styleCopy = normalizeStyleCopy(body.styleCopy);
+      if ((targetProject.workflowMode || "single-video-v1") === "multi-asset-v1") assertReferenceStyleCapability(referenceStyleRollout, "multi");
+      const pack = await loadStylePack(stylePackId, version, { root: styleLibraryRoot });
+      if (pack.status !== "approved") return json(res, 409, { error: "StylePack 尚未审批，不能应用到项目" });
+      assertStylePackCompatible(pack, targetProject.workflowMode || "single-video-v1");
+      const reference = await findReferenceByAnalysisId(pack.manifest.sourceAnalysisId);
+      if (!reference) return json(res, 409, { error: "StylePack 的来源参考分析不存在" });
+      if (!reference.referenceUsageConfirmedAt) return json(res, 409, { error: "StylePack 的来源参考视频缺少分析和使用许可确认" });
+      applyStyleSelectionToProject(targetProject, {
+        pack,
+        reference,
+        styleCopy,
+        bumpPlanVersion: true,
+      });
+      if (targetProject.plan || targetProject.multiAssetPlan) targetProject.status = "plan_ready";
+      await save(targetProject);
+      return json(res, 200, projectView(targetProject));
+    } catch (error) {
+      return json(res, error.statusCode || 409, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && segments[0] === "api" && segments[1] === "projects" && segments[2] && segments[3] === "style-preview" && segments.length === 4) {
+    if (rejectMissingStyleCapability(res, "preview")) return;
+    const targetProject = store.get(segments[2]);
+    if (!targetProject) return json(res, 404, { error: "project not found" });
+    if (targetProject.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材风格 proof 请使用项目的横竖屏预览" });
+    if (!targetProject.stylePack || targetProject.stylePack.status !== "approved") return json(res, 409, { error: "请先应用已审批的 StylePack" });
+    if (!targetProject.styleProjectPath || !targetProject.plan) return json(res, 409, { error: "当前项目缺少 StyleProject 或剪辑计划" });
+    const media = targetProject.media;
+    if (!media?.width || !media?.height) return json(res, 409, { error: "当前项目缺少有效视频尺寸" });
+    if (!targetProject.referenceAnalysis) return json(res, 409, { error: "当前项目缺少参考分析证据" });
+    if (!/^[a-f0-9]{64}$/i.test(String(targetProject.stylePack.manifestSha256 || ""))) return json(res, 409, { error: "当前 StylePack 缺少有效 manifest 哈希" });
+    const styleProjectHash = await hashStyleProject(targetProject.styleProjectPath);
+    if (targetProject.stylePack.codeSha256 && styleProjectHash !== targetProject.stylePack.codeSha256) return json(res, 409, { error: "StyleProject 内容哈希已变化，请重新审批风格包" });
+    const scale = Math.min(1, 960 / Math.max(media.width, media.height));
+    const width = Math.max(16, Math.round(media.width * scale / 2) * 2);
+    const height = Math.max(16, Math.round(media.height * scale / 2) * 2);
+    const workDir = join(targetProject.dir, "style-preview-work", randomUUID());
+    const basePath = join(workDir, "base.mp4");
+    const overlayPath = join(workDir, "overlay.mov");
+    const durationMs = 3000;
+    try {
+      await fs.mkdir(workDir, { recursive: true });
+      await runProcess("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", `color=c=0x222222:s=${width}x${height}:r=30:d=3`,
+        "-f", "lavfi", "-i", "sine=frequency=220:duration=3",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", basePath,
+      ], workDir);
+      const sourceCaptions = (targetProject.transcript?.segments || []).map((segment) => ({
+        id: String(segment.id),
+        startMs: Math.max(0, Number(segment.startMs) || 0),
+        endMs: Math.min(durationMs, Number(segment.endMs) || 0),
+        text: String(segment.text || ""),
+      })).filter((segment) => segment.endMs > segment.startMs && segment.text.trim());
+      const captions = regroupCaptionCues(sourceCaptions, targetProject.styleApplication?.captionPolicy?.wordsPerCue);
+      const visualEvents = (targetProject.plan.visualEvents || []).map((event) => ({
+        ...event,
+        startMs: Math.max(0, Number(event.startMs) || 0),
+        endMs: Math.min(durationMs, Number(event.endMs) || 0),
+      })).filter((event) => event.endMs > event.startMs);
+      const layoutEvents = (targetProject.plan.layoutEvents || []).map((event) => ({
+        ...event,
+        startMs: Math.max(0, Number(event.startMs) || 0),
+        endMs: Math.min(durationMs, Number(event.endMs) || 0),
+      })).filter((event) => event.endMs > event.startMs);
+      if (!visualEvents.length && !layoutEvents.length && !captions.length) throw new Error("没有可展示的风格事件，请先生成剪辑计划");
+      const normalizedCaptionStyle = normalizeCaptionStyle(targetProject.plan.captionStyle);
+      const styleApplicationEvidence = styleRenderEvidence(
+        targetProject.styleApplication,
+        targetProject.plan,
+        "single-video-v1",
+      );
+      const styleApplicationHash = valueHash(styleApplicationEvidence);
+      if (targetProject.styleApplicationHash && styleApplicationHash !== targetProject.styleApplicationHash) {
+        return json(res, 409, { error: "当前风格应用参数已变化，请重新应用 StylePack 后再生成 style proof" });
+      }
+      const styleProvenance = {
+        stylePackId: targetProject.stylePackId,
+        styleVersion: Number(targetProject.styleVersion),
+        styleManifestSha256: String(targetProject.stylePack.manifestSha256).toLowerCase(),
+        styleProjectHash,
+        referenceAnalysisSha256: valueHash(targetProject.referenceAnalysis),
+        styleApplicationSha256: styleApplicationHash,
+      };
+      const overlay = await renderStyleProject({
+        projectDir: targetProject.styleProjectPath,
+        compositionId: "ReferenceStyle",
+        outputPath: overlayPath,
+        props: {
+          width,
+          height,
+          fps: 30,
+          durationMs,
+          captions,
+          visualEvents,
+          layoutEvents,
+          styleParams: targetProject.plan.styleParameters || targetProject.styleParameters || {},
+          captionStyle: normalizedCaptionStyle,
+          styleSpec: targetProject.referenceAnalysis?.styleSpec || targetProject.stylePack?.manifest?.styleSpec || null,
+        },
+      });
+      const name = `style-preview-${randomUUID().slice(0, 8)}.mp4`;
+      const outputPath = join(targetProject.dir, "artifacts", name);
+      await fs.mkdir(dirname(outputPath), { recursive: true });
+      const output = await compositeRemotionPreview({
+        inputPath: basePath,
+        overlayPath,
+        outputPath,
+        subtitlePath: null,
+        layoutEvents,
+        durationMs,
+        phase: "plan",
+      });
+      targetProject.artifacts = [...(targetProject.artifacts || []), {
+        name,
+        kind: "style-preview",
+        version: Number(targetProject.plan?.styleVersion || 1),
+        planVersion: Number(targetProject.plan?.version || 1),
+        width: output.width,
+        height: output.height,
+        durationMs: output.durationMs,
+        stylePackId: targetProject.stylePackId,
+        styleVersion: targetProject.styleVersion,
+        styleProvenance,
+        generatedAt: new Date().toISOString(),
+      }];
+      await save(targetProject);
+      return json(res, 201, projectView(targetProject));
+    } catch (error) {
+      return json(res, error.statusCode || 422, { error: error.message });
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
   if (req.method === "GET" && url.pathname === "/api/projects") {
@@ -742,6 +1317,11 @@ async function handle(req, res) {
       await fs.writeFile(join(project.dir, "transcript.reviewed.json"), JSON.stringify(result.transcript, null, 2));
       await writeTranscriptArtifacts(project, result.transcript);
       project.transcript = result.transcript;
+      if (project.plan) {
+        const protectedPlan = protectTranscriptCorrections(project.plan, result.transcript);
+        project.plan = protectedPlan.plan;
+        if (protectedPlan.adjustedSegmentIds.length) await fs.writeFile(join(project.dir, "cut-list.json"), JSON.stringify(project.plan, null, 2));
+      }
       project.proofreading = nextProofreading;
       project.qc = null;
       project.status = project.plan ? "preview_ready" : "transcript_ready";
@@ -822,10 +1402,19 @@ async function handle(req, res) {
       const planFiles = await fs.readdir(project.dir);
       const storedVersions = planFiles.map((name) => Number(name.match(/^multi-plan-v(\d+)\.json$/)?.[1] || 0));
       nextPlan.version = Math.max(nextPlan.version, 1 + Math.max(0, ...storedVersions));
-      const planPath = join(project.dir, `multi-plan-v${nextPlan.version}.json`);
-      await fs.writeFile(planPath, JSON.stringify(nextPlan, null, 2), { flag: "wx" });
-      if (previousPlan && !project.multiAssetPlanHistory?.some((item) => Number(item.version) === Number(previousPlan.version))) project.multiAssetPlanHistory = [...(project.multiAssetPlanHistory || []), previousPlan];
-      project.multiAssetPlan = nextPlan;
+      if (project.stylePack) {
+        applyStyleSelectionToProject(project, {
+          pack: project.stylePack,
+          reference: { id: project.referenceStyleId, analysis: project.referenceAnalysis },
+          styleCopy: project.styleCopy,
+          sourceMultiAssetPlan: nextPlan,
+        });
+      } else {
+        if (previousPlan && !project.multiAssetPlanHistory?.some((item) => Number(item.version) === Number(previousPlan.version))) project.multiAssetPlanHistory = [...(project.multiAssetPlanHistory || []), previousPlan];
+        project.multiAssetPlan = nextPlan;
+      }
+      const planPath = join(project.dir, `multi-plan-v${project.multiAssetPlan.version}.json`);
+      await fs.writeFile(planPath, JSON.stringify(project.multiAssetPlan, null, 2), { flag: "wx" });
       project.multiAssetPreview = null;
       project.plan = null;
       project.qc = null;
@@ -1143,6 +1732,11 @@ async function handle(req, res) {
     } catch (error) { return json(res, error.statusCode || 400, { error: error.message, status: project.status }); }
   }
   if (req.method === "POST" && segments[3] === "render") {
+    try {
+      assertStyleExportAllowed({ config: referenceStyleRollout, project });
+    } catch (error) {
+      return json(res, error.statusCode || 403, { error: error.message, status: project.status });
+    }
     if (project.workflowMode === "multi-asset-v1") {
       if (!project.multiAssetPlan?.confirmed) return json(res, 409, { error: "请先检查并确认多素材剪辑方案", status: project.status });
       if (!project.multiAssetPreview?.qc?.passed || Number(project.multiAssetPreview.planVersion) !== Number(project.multiAssetPlan.version) || Number(project.multiAssetPreview.inputRevision) !== Number(project.multiAssetRevision || 0)) return json(res, 409, { error: "请先生成并检查当前方案和素材配置的横竖屏预览", status: project.status });
@@ -1181,5 +1775,7 @@ async function handle(req, res) {
   }
   return json(res, 404, { error: "route not found" });
 }
+
+await pruneWechatSources(store.root).catch(() => undefined);
 
 createServer((req, res) => { handle(req, res).catch((error) => { if (!req.aborted && !res.writableEnded) json(res, error.statusCode || 500, { error: error.message }); }); }).listen(Number(process.env.PORT || 18787), process.env.HOST || "127.0.0.1", () => console.log(`Wayne portal API listening on http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 18787}`));

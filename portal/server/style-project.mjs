@@ -37,11 +37,17 @@ function safeId(value) {
 export function validateStyleManifest(raw) {
   assertObject(raw, "StyleManifest");
   assertKeys(raw, MANIFEST_KEYS, "StyleManifest");
-  if (!["style-manifest.v1", "style-manifest.v2"].includes(raw.contract)) {
-    throw new Error("StyleManifest contract must be style-manifest.v1 or style-manifest.v2");
+  if (!["style-manifest.v1", "style-manifest.v2", "style-manifest.v3"].includes(raw.contract)) {
+    throw new Error("StyleManifest contract must be style-manifest.v1, style-manifest.v2 or style-manifest.v3");
   }
   const styleSpec = raw.styleSpec ? normalizeStyleSpec(raw.styleSpec) : null;
   if (raw.contract === "style-manifest.v2" && !styleSpec) throw new Error("StyleManifest v2 requires styleSpec");
+  if (raw.contract === "style-manifest.v3" && styleSpec?.contract !== "style-spec.v3") {
+    throw new Error("StyleManifest v3 requires StyleSpec v3");
+  }
+  if (raw.contract === "style-manifest.v2" && styleSpec?.contract === "style-spec.v3") {
+    throw new Error("StyleManifest v2 cannot embed StyleSpec v3");
+  }
   safeId(raw.id);
   const name = String(raw.name || "").trim();
   if (!name || name.length > 120) throw new Error("StyleManifest name is invalid");
@@ -164,7 +170,11 @@ export function defaultManifest(analysis, overrides = {}) {
     throw new Error("ReferenceAnalysis v2 must include styleSpec");
   }
   return validateStyleManifest({
-    contract: styleSpec ? "style-manifest.v2" : "style-manifest.v1",
+    contract: styleSpec?.contract === "style-spec.v3"
+      ? "style-manifest.v3"
+      : styleSpec
+        ? "style-manifest.v2"
+        : "style-manifest.v1",
     id,
     name: String(overrides.name || `Draft style ${analysisId.slice(0, 8)}`),
     version: 1,

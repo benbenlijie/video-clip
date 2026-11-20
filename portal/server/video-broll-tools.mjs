@@ -48,6 +48,40 @@ async function probeDownloaded(path) {
   });
 }
 
+async function saveDownloadedResponse(response, url, candidate, workspaceDir, fileStem) {
+  const declared = Number(response.headers.get("content-length") || 0);
+  if (declared > MAX_DOWNLOAD_BYTES) throw new Error("B-roll 文件超过 100MB 限制");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_DOWNLOAD_BYTES) throw new Error("B-roll 文件大小无效或超过 100MB 限制");
+  const assetId = randomUUID();
+  const stem = String(fileStem || "broll").replace(/[^a-z0-9-]/gi, "").slice(0, 80) || "broll";
+  const targetName = `${stem}-${assetId}.mp4`;
+  const target = resolve(workspaceDir, targetName);
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.writeFile(target, bytes, { flag: "wx" });
+  let media;
+  try { media = await probeDownloaded(target); } catch (error) { await fs.rm(target, { force: true }); throw error; }
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return { assetId, filename: targetName, path: targetName, provider: candidate.provider, providerId: candidate.providerId, sourceUrl: candidate.sourceUrl, creator: candidate.creator, creatorUrl: candidate.creatorUrl, licenseName: candidate.licenseName, licenseUrl: candidate.licenseUrl, downloadUrl: url.toString(), downloadedAt: new Date().toISOString(), sha256, bytes: bytes.byteLength, ...media };
+}
+
+export async function downloadBrollCandidate({ candidate, workspaceDir, fetchImpl = fetch, fileStem = "broll" } = {}) {
+  if (!candidate?.downloadUrl) throw new Error("缺少 B-roll 下载地址");
+  if (!workspaceDir) throw new Error("缺少 B-roll 下载目录");
+  const url = validateAssetUrl(candidate.downloadUrl);
+  const response = await fetchImpl(url, { redirect: "manual", signal: AbortSignal.timeout(20000) });
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get("location");
+    if (!location) throw new Error("素材下载重定向缺少目标");
+    const redirect = validateAssetUrl(new URL(location, url).toString());
+    const redirected = await fetchImpl(redirect, { redirect: "manual", signal: AbortSignal.timeout(20000) });
+    if (!redirected.ok) throw new Error(`素材 CDN 返回 HTTP ${redirected.status}`);
+    return await saveDownloadedResponse(redirected, redirect, candidate, workspaceDir, fileStem);
+  }
+  if (!response.ok) throw new Error(`素材 CDN 返回 HTTP ${response.status}`);
+  return await saveDownloadedResponse(response, url, candidate, workspaceDir, fileStem);
+}
+
 export function registerBrollTools(server, { workspaceDir, auditPath, cachePath, fetchImpl = fetch } = {}) {
   const candidates = new Map();
   const audit = auditWriter(auditPath);
@@ -89,36 +123,12 @@ export function registerBrollTools(server, { workspaceDir, auditPath, cachePath,
     if (downloadCount >= MAX_DOWNLOADS) throw new Error(`本轮最多自动下载 ${MAX_DOWNLOADS} 个 B-roll 素材`);
     const candidate = candidates.get(candidateHandle);
     if (!candidate) throw new Error("候选素材句柄无效或不属于当前搜索会话");
-    const url = validateAssetUrl(candidate.downloadUrl);
-    const response = await fetchImpl(url, { redirect: "manual", signal: AbortSignal.timeout(20000) });
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (!location) throw new Error("素材下载重定向缺少目标");
-      const redirect = validateAssetUrl(new URL(location, url).toString());
-      const redirected = await fetchImpl(redirect, { redirect: "manual", signal: AbortSignal.timeout(20000) });
-      if (!redirected.ok) throw new Error(`素材 CDN 返回 HTTP ${redirected.status}`);
-      return await saveResponse(redirected, redirect, candidate);
-    }
-    if (!response.ok) throw new Error(`素材 CDN 返回 HTTP ${response.status}`);
-    return await saveResponse(response, url, candidate);
-  });
-
-  async function saveResponse(response, url, candidate) {
-    const declared = Number(response.headers.get("content-length") || 0);
-    if (declared > MAX_DOWNLOAD_BYTES) throw new Error("B-roll 文件超过 100MB 限制");
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength === 0 || bytes.byteLength > MAX_DOWNLOAD_BYTES) throw new Error("B-roll 文件大小无效或超过 100MB 限制");
-    const assetId = randomUUID();
-    const targetName = `broll-${assetId}.mp4`;
-    const target = resolve(workspaceDir, targetName);
-    await fs.writeFile(target, bytes, { flag: "wx" });
-    let media;
-    try { media = await probeDownloaded(target); } catch (error) { await fs.rm(target, { force: true }); throw error; }
-    const sha256 = createHash("sha256").update(bytes).digest("hex");
-    const asset = { assetId, candidateHandle: candidate.candidateHandle, filename: targetName, path: targetName, provider: candidate.provider, providerId: candidate.providerId, sourceUrl: candidate.sourceUrl, creator: candidate.creator, creatorUrl: candidate.creatorUrl, licenseName: candidate.licenseName, licenseUrl: candidate.licenseUrl, downloadUrl: url.toString(), downloadedAt: new Date().toISOString(), sha256, bytes: bytes.byteLength, ...media };
-    downloadCount += 1; candidates.delete(candidate.candidateHandle); await audit({ tool: "download_broll", ...asset });
+    const asset = await downloadBrollCandidate({ candidate, workspaceDir, fetchImpl });
+    downloadCount += 1;
+    candidates.delete(candidate.candidateHandle);
+    await audit({ tool: "download_broll", ...asset });
     return { content: [{ type: "text", text: JSON.stringify(asset) }] };
-  }
+  });
 }
 
 export async function startBrollTools(options) {

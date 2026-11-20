@@ -1,10 +1,14 @@
-const CONTRACT = "style-spec.v2";
+const V2_CONTRACT = "style-spec.v2";
+const V3_CONTRACT = "style-spec.v3";
+const CONTRACTS = new Set([V2_CONTRACT, V3_CONTRACT]);
 const ANCHORS = new Set([
   "top_left", "top_center", "top_right",
   "middle_left", "middle_center", "middle_right",
   "bottom_left", "bottom_center", "bottom_right",
 ]);
 const FONT_FAMILIES = new Set(["sans", "serif", "display", "rounded"]);
+const FONT_FAMILY_PATTERN = /^[A-Za-z0-9 ,'"_\-]{1,120}$/;
+const FONT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{2,80}$/;
 const ANIMATION_TYPES = new Set(["none", "fade", "scale", "fade-scale", "slide-up", "wipe"]);
 const EASINGS = new Set(["linear", "ease-in", "ease-out", "ease-in-out", "spring"]);
 const STAGGERS = new Set(["none", "word", "char"]);
@@ -53,14 +57,23 @@ function normalizePanel(raw = {}) {
   };
 }
 
-function normalizeTypography(raw = {}) {
+function normalizeTypography(raw = {}, contract = V2_CONTRACT) {
   const value = object(raw, "StyleSpec typography");
+  const v3 = contract === V3_CONTRACT;
   keys(value, new Set([
     "fontFamily", "fontWeight", "fontSizeRatio", "lineHeight", "letterSpacingRatio",
     "color", "strokeColor", "strokeWidthRatio", "shadowOpacity", "shadowBlurRatio", "shadowOffsetYRatio",
+    ...(v3 ? ["fontId", "fontWidthScale"] : []),
   ]), "StyleSpec typography");
+  const fontFamily = v3
+    ? (FONT_FAMILY_PATTERN.test(String(value.fontFamily || "")) ? String(value.fontFamily) : "sans")
+    : choice(value.fontFamily, FONT_FAMILIES, "sans", "fontFamily");
   return {
-    fontFamily: choice(value.fontFamily, FONT_FAMILIES, "sans", "fontFamily"),
+    fontFamily,
+    ...(v3 ? {
+      fontId: FONT_ID_PATTERN.test(String(value.fontId || "")) ? String(value.fontId) : "system-sans",
+      fontWidthScale: number(value.fontWidthScale, 1, 0.7, 1.3),
+    } : {}),
     fontWeight: Math.round(number(value.fontWeight, 700, 300, 900)),
     fontSizeRatio: number(value.fontSizeRatio, 0.05, 0.01, 0.2),
     lineHeight: number(value.lineHeight, 1.15, 0.8, 2),
@@ -110,7 +123,7 @@ function normalizeHighlight(raw = {}) {
   };
 }
 
-function normalizeTitle(raw = {}) {
+function normalizeTitle(raw = {}, contract = V2_CONTRACT) {
   const value = object(raw, "StyleSpec title");
   keys(value, new Set(["anchor", "widthRatio", "maxLines", "panel", "primary", "secondary", "motion"]), "StyleSpec title");
   return {
@@ -118,26 +131,31 @@ function normalizeTitle(raw = {}) {
     widthRatio: number(value.widthRatio, 1, 0.2, 1),
     maxLines: Math.round(number(value.maxLines, 2, 1, 3)),
     panel: normalizePanel(value.panel),
-    primary: normalizeTypography(value.primary),
-    secondary: normalizeTypography(value.secondary),
+    primary: normalizeTypography(value.primary, contract),
+    secondary: normalizeTypography(value.secondary, contract),
     motion: normalizeMotion(value.motion, "StyleSpec title.motion"),
   };
 }
 
-function normalizeIdentity(raw = {}) {
+function normalizeIdentity(raw = {}, contract = V2_CONTRACT) {
   const value = object(raw, "StyleSpec identity");
-  keys(value, new Set(["anchor", "maxWidthRatio", "panel", "primary", "secondary", "motion"]), "StyleSpec identity");
+  const v3 = contract === V3_CONTRACT;
+  keys(value, new Set(["anchor", "maxWidthRatio", "panel", "primary", "secondary", "motion", ...(v3 ? ["offsetYRatio", "maxLines"] : [])]), "StyleSpec identity");
   return {
     anchor: choice(value.anchor, ANCHORS, "middle_right", "identity.anchor"),
     maxWidthRatio: number(value.maxWidthRatio, 0.42, 0.2, 0.8),
+    ...(v3 ? {
+      offsetYRatio: number(value.offsetYRatio, 0, -0.3, 0.3),
+      maxLines: Math.round(number(value.maxLines, 4, 1, 6)),
+    } : {}),
     panel: normalizePanel(value.panel),
-    primary: normalizeTypography(value.primary),
-    secondary: normalizeTypography(value.secondary),
+    primary: normalizeTypography(value.primary, contract),
+    secondary: normalizeTypography(value.secondary, contract),
     motion: normalizeMotion(value.motion, "StyleSpec identity.motion"),
   };
 }
 
-function normalizeCaptions(raw = {}) {
+function normalizeCaptions(raw = {}, contract = V2_CONTRACT) {
   const value = object(raw, "StyleSpec captions");
   keys(value, new Set(["grouping", "maxCharsPerCue", "anchor", "maxWidthRatio", "panel", "typography", "highlight", "motion"]), "StyleSpec captions");
   return {
@@ -146,7 +164,7 @@ function normalizeCaptions(raw = {}) {
     anchor: choice(value.anchor, new Set(["top_center", "middle_center", "bottom_center"]), "bottom_center", "captions.anchor"),
     maxWidthRatio: number(value.maxWidthRatio, 0.86, 0.3, 1),
     panel: normalizePanel(value.panel),
-    typography: normalizeTypography(value.typography),
+    typography: normalizeTypography(value.typography, contract),
     highlight: normalizeHighlight(value.highlight),
     motion: normalizeMotion(value.motion, "StyleSpec captions.motion"),
   };
@@ -173,7 +191,8 @@ function normalizeEffects(raw = []) {
 export function normalizeStyleSpec(raw, { aspectRatio = null } = {}) {
   const value = object(raw, "StyleSpec");
   keys(value, new Set(["contract", "canvas", "title", "identity", "captions", "effects"]), "StyleSpec");
-  if (value.contract !== CONTRACT) throw new Error(`StyleSpec contract must be ${CONTRACT}`);
+  if (!CONTRACTS.has(value.contract)) throw new Error(`StyleSpec contract must be ${[...CONTRACTS].join(" or ")}`);
+  const contract = value.contract;
   const canvas = object(value.canvas, "StyleSpec canvas");
   keys(canvas, new Set(["aspectRatio", "safeArea"]), "StyleSpec canvas");
   const safeArea = object(canvas.safeArea, "StyleSpec canvas.safeArea");
@@ -183,7 +202,7 @@ export function normalizeStyleSpec(raw, { aspectRatio = null } = {}) {
     throw new Error(`StyleSpec aspectRatio ${resolvedAspectRatio} does not match source ${aspectRatio}`);
   }
   return {
-    contract: CONTRACT,
+    contract,
     canvas: {
       aspectRatio: resolvedAspectRatio,
       safeArea: {
@@ -193,9 +212,9 @@ export function normalizeStyleSpec(raw, { aspectRatio = null } = {}) {
         leftRatio: number(safeArea.leftRatio, 0.06, 0, 0.3),
       },
     },
-    title: normalizeTitle(value.title),
-    identity: normalizeIdentity(value.identity),
-    captions: normalizeCaptions(value.captions),
+    title: normalizeTitle(value.title, contract),
+    identity: normalizeIdentity(value.identity, contract),
+    captions: normalizeCaptions(value.captions, contract),
     effects: normalizeEffects(value.effects || []),
   };
 }

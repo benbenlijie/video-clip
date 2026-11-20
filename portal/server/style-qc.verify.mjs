@@ -100,6 +100,29 @@ assert.deepEqual(metrics, {
 const layoutDisabled = computeStyleMetrics({ referenceAnalysis, userFacts: facts, copy: { copyLayout: false } });
 assert.equal(layoutDisabled.punchInRatioDelta, null);
 assert.equal(layoutDisabled.visualEventRateDelta, null);
+assert.deepEqual(
+  (() => {
+    const metrics = computeStyleMetrics({
+      referenceAnalysis: {
+        ...referenceAnalysis,
+        captions: { ...referenceAnalysis.captions, maxWordsPerCue: 9, fontSizeRatio: 0.08 },
+        styleSpec: {
+          contract: "style-spec.v3",
+          captions: {
+            maxCharsPerCue: 5,
+            typography: { fontSizeRatio: 0.05 },
+          },
+        },
+      },
+      userFacts: facts,
+    });
+    return {
+      captionWordsPerCueDelta: metrics.captionWordsPerCueDelta,
+      captionFontRatioDelta: metrics.captionFontRatioDelta,
+    };
+  })(),
+  { captionWordsPerCueDelta: 0, captionFontRatioDelta: 0 },
+);
 const previewMetrics = computeStyleMetrics({
   referenceAnalysis,
   userFacts: {
@@ -117,6 +140,17 @@ const previewMetrics = computeStyleMetrics({
 assert.equal(previewMetrics.hookLengthDelta, null);
 assert.equal(previewMetrics.avgShotLengthDelta, null);
 assert.equal(previewMetrics.visualEventRateDelta, null);
+const singleShotMetrics = computeStyleMetrics({
+  referenceAnalysis: {
+    ...referenceAnalysis,
+    shots: [{ id: "single", startMs: 0, endMs: 40000, role: "hook", layout: "full", broll: false }],
+    rhythm: { hookMs: 40000, avgShotMs: 40000, cutsPerMinute: 0, punchInRatio: 0, brollRatio: 0 },
+  },
+  userFacts: facts,
+});
+assert.equal(singleShotMetrics.cutDensityDelta, null);
+assert.equal(singleShotMetrics.avgShotLengthDelta, null);
+assert.equal(singleShotMetrics.hookLengthDelta, null);
 
 assert.deepEqual(findCaptionFaceOverlaps({
   probe: { width: 1080, height: 1920 },

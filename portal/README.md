@@ -83,9 +83,32 @@ WAYNE_AUDIO_ANALYSIS_PYTHON=python3
 
 ### Claude Code 媒体编辑器
 
-剪辑阶段会在项目中加载 `agent-skills/video-edit/SKILL.md`。Opus 检查旋转、音轨、真实原片帧和逐词转录，自主决定是否需要 B-roll；需要时通过受限 MCP 搜索 Pexels/Pixabay、查看候选缩略图、自动下载最多 3 条素材，并把实际来源、许可信息、SHA-256 和插入时间写入工程。随后它编写字幕与剪辑脚本：新工程将 Remotion 动效合成到统一草剪，旧工程保留 HyperFrames 等原方式；用户直接提出修改后继续同一工程，确认后导出终稿并重新抽帧审查。短样例可以没有额外 Shorts、标题卡或 CTA。媒体工具遵循工作区路径校验和媒体格式限制；当前兼容模式不提供内核级断网或文件系统隔离，任意外部 URL、外域重定向和项目数据上传都不得调用。
+剪辑阶段会在项目中加载 `agent-skills/video-edit/SKILL.md`。Opus 检查旋转、音轨、真实原片帧和逐词转录，自主决定是否需要 B-roll；需要时通过受限 MCP 搜索 Pexels/Pixabay、Mixkit/Coverr 和影视飓风目录，查看候选缩略图、下载选定素材，并把实际来源、许可信息、SHA-256 和插入时间写入工程。影视飓风仍要求用户自己完成官网授权订单和网盘获取。随后它编写字幕与剪辑脚本：新工程将 Remotion 动效合成到统一草剪，旧工程保留 HyperFrames 等原方式；用户直接提出修改后继续同一工程，确认后导出终稿并重新抽帧审查。短样例可以没有额外 Shorts、标题卡或 CTA。媒体工具遵循工作区路径校验和媒体格式限制；当前兼容模式不提供内核级断网或文件系统隔离，任意外部 URL、外域重定向和项目数据上传都不得调用。
 
 Claude Code 只拿到这个样例工作区和媒体 MCP 工具。工具可返回真实视频帧供视觉审查。由于当前宿主不允许 Claude 沙箱内再创建 namespace，媒体工具临时采用直接执行兼容模式：清理环境变量并保留应用层工作区路径校验，但不提供内核级路径或网络隔离。Claude 不得主动读取工作区之外的文件、抓取外部 URL 或上传项目数据。每阶段模型费用限额为计划 `$4`、终稿 `$6`，Claude Code 会话硬上限为 30 分钟。产物保留原视频之外的版本化预览、终稿、SRT/ASS、源码、工具日志和 QC 报告。人工仍须完整观看交付视频；AI 抽帧报告不是最终验收。
+
+## 多源 B-roll（Mixkit / Coverr / 影视飓风）
+
+除了 Pexels/Pixabay，项目提供 `broll-sources` 技能和 MCP，用于按具体画面搜索精选素材、查看缩略图、下载并记录授权。Mixkit 的单条 Restricted 720p 只允许个人使用，不能因为“免费下载”就用于商业项目；Coverr 使用其免费商用许可；影视飓风只做公开目录检索，用户必须自己在官网完成登录、实名校验和 0 元授权订单，再把百度网盘分享链接交给下载工具。
+
+```bash
+# 项目内已注册进 video MCP，剪辑代理可直接使用：
+# mcp__video__search_broll_sources
+# mcp__video__inspect_broll_candidate
+# mcp__video__download_broll_candidate
+
+npm run verify:broll-sources
+```
+
+独立 MCP：
+
+```json
+{ "mcpServers": { "broll-sources": { "command": "node", "args": ["server/broll-source-tools.mjs", "/absolute/path/to/workdir", "/absolute/path/to/workdir/.audit/broll-sources.jsonl"] } } }
+```
+
+- 技能正文：`agent-skills/broll-sources/SKILL.md`
+- 运行时自动发现：`.agents/skills/broll-sources`
+- Mixkit/Coverr 直链下载统一写入工作区 `downloads/`，每条最多 100MB；影视飓风走百度网盘，单条原片可能更大，进入项目前先看大小并转成 1080p 代理（多素材入口单段上限 500MB、项目总计 5GB）；Log 原片需先做 LUT/Rec.709
 
 ## 视频号素材下载（wx-video-download）
 

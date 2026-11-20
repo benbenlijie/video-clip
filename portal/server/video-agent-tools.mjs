@@ -11,9 +11,12 @@ import { compositeRemotionPreview, remotionRuntimeAvailable, renderRemotionOverl
 import { detectBlackFrames, probeOutput } from "./render.mjs";
 import { toTimelineV1 } from "./timeline-contract.mjs";
 import { registerBrollTools } from "./video-broll-tools.mjs";
+import { registerBrollSourceTools } from "./broll-source-tools.mjs";
 import { workspacePath } from "./workspace-path.mjs";
 import { composeRemotionMain } from "./remotion-main.mjs";
 import { protectTranscriptCorrections } from "./edit-plan.mjs";
+import { analyzeFluency, verifyFluency } from "./fluency.mjs";
+import { deepSeekDelegationMode, runDeepSeekDelegate } from "./deepseek-delegate.mjs";
 
 const portalRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -58,6 +61,8 @@ export async function sandboxCommand(workDir, command, timeoutMs = 180000) {
 export async function startMediaTools(workDir, auditPath) {
   const root = await fs.realpath(workDir);
   const audit = async (entry) => fs.appendFile(auditPath, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  const delegationMode = deepSeekDelegationMode(process.env.WAYNE_DEEPSEEK_DELEGATION);
+  const forceDirectWrites = new Set(["edit-plan.json", "content-copy.json", "manifest.json"]);
   const protectWorkspacePlan = async (source) => {
     let planText;
     try { planText = await fs.readFile(await workspacePath(root, "edit-plan.json"), "utf8"); }
@@ -73,10 +78,34 @@ export async function startMediaTools(workDir, auditPath) {
   let remotionPreviewCount = 0;
   const server = new McpServer({ name: "video-editing", version: "1.0.0" });
   registerBrollTools(server, { workspaceDir: root, auditPath: join(dirname(auditPath), "broll-audit.jsonl"), cachePath: join(dirname(auditPath), "broll-cache.json") });
+  registerBrollSourceTools(server, { workspaceDir: root, auditPath: join(dirname(auditPath), "broll-sources-audit.jsonl") });
   const register = (name, description, inputSchema, handler) => server.registerTool(name, { description, inputSchema }, async (args) => {
     try { return await handler(args); } catch (error) { await audit({ tool: name, error: error.message }); return { isError: true, content: [{ type: "text", text: error.message }] }; }
   });
+  if (delegationMode !== "off") {
+    register("delegate_task", "Delegate one bounded execution task to the local DeepSeek harness. Give exact inputs, required outputs and constraints. This worker can use shell, FFmpeg, FFprobe, Python/Node and filesystem tools in the current workspace. Every call starts a fresh worker session, so include all needed context. The director must inspect its outputs and keep creative/visual decisions. Batch related work into one phase-level task instead of one task per command, and retry at most once.", {
+      role: z.enum(["analysis", "script", "media", "captions", "broll", "qc"]).default("script"),
+      objective: z.string().min(1).max(4000),
+      inputs: z.array(z.string().min(1).max(500)).max(50).default([]),
+      outputs: z.array(z.string().min(1).max(500)).min(1).max(50),
+      constraints: z.array(z.string().min(1).max(1000)).max(20).default([]),
+      timeoutSeconds: z.number().int().min(10).max(300).default(180),
+    }, async ({ role, objective, inputs, outputs, constraints, timeoutSeconds }) => {
+      const result = await runDeepSeekDelegate({
+        root,
+        auditPath,
+        request: { role, objective, inputs, outputs, constraints },
+        timeoutMs: timeoutSeconds * 1000,
+      });
+      await audit({ tool: "delegate_task", role, status: result.status, sessionId: result.sessionId, outputs: result.outputs.map((item) => item.path), logFile: result.logFile });
+      return {
+        ...(result.status === "completed" ? {} : { isError: true }),
+        content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    });
+  }
   register("execute", "Run FFmpeg, FFprobe, Python, Node or HyperFrames commands in an isolated Linux workspace. Only /work is writable. This host-compatible fallback inherits the parent network namespace, so do not fetch or upload project data. Paths: /work, /tools/node, /tools/hyperframes/node_modules/hyperframes/bin/hyperframes.mjs. Write your own scripts; inspect and iterate. Protected transcript intervals are normalized before and after each command. If normalization happens after a command that also rendered media, rerender with the saved plan.", { command: z.string().max(30000), timeoutSeconds: z.number().min(1).max(240).default(180) }, async ({ command, timeoutSeconds }) => {
+    if (delegationMode === "force") throw new Error("DeepSeek delegation is forced: send concrete execution commands through delegate_task");
     const protectedBefore = await protectWorkspacePlan("before-execute");
     if (protectedBefore.length) {
       await audit({ tool: "execute", command, blocked: true, reason: "protected-transcript-plan-changed", adjustedSegmentIds: protectedBefore });
@@ -92,6 +121,8 @@ export async function startMediaTools(workDir, auditPath) {
     return { isError: result.code !== 0, content: [{ type: "text", text: `${JSON.stringify(result)}${note}` }] };
   });
   register("write_file", "Create or update an editable script, subtitle file, composition HTML, edit plan or manifest inside the workspace. Use relative paths.", { path: z.string(), content: z.string().max(300000) }, async ({ path, content }) => {
+    const directPath = String(path).replaceAll("\\", "/").replace(/^\.\//, "");
+    if (delegationMode === "force" && !forceDirectWrites.has(directPath)) throw new Error("DeepSeek delegation is forced: only edit-plan.json, content-copy.json and manifest.json may be written directly");
     const target = await workspacePath(root, path, { existing: false });
     await fs.mkdir(dirname(target), { recursive: true });
     await fs.writeFile(target, content);
@@ -105,6 +136,29 @@ export async function startMediaTools(workDir, auditPath) {
     if ((await fs.stat(target)).size > 350000) throw new Error("Text file exceeds 350KB; use execute to inspect a range");
     await audit({ tool: "read_file", path });
     return { content: [{ type: "text", text: await fs.readFile(target, "utf8") }] };
+  });
+  register("analyze_fluency", "Analyze retained word timings for hard fillers, semantic particles, long pauses and a proposed fluency EDL. Writes a fluency-report.v1 JSON with proposedPieces. This tool does not mutate media or edit-plan.json; use proposedPieces to rebuild the base video, then regenerate captions/timeline.", {
+    transcript: z.string().min(1).default("transcript.json"),
+    timeline: z.string().min(1).optional(),
+    output: z.string().min(1).default("fluency-report.json"),
+  }, async ({ transcript: transcriptPath, timeline: timelinePath, output }) => {
+    const transcript = JSON.parse(await fs.readFile(await workspacePath(root, transcriptPath), "utf8"));
+    const timeline = timelinePath ? JSON.parse(await fs.readFile(await workspacePath(root, timelinePath), "utf8")) : null;
+    const report = analyzeFluency({ transcript, timeline });
+    const target = await workspacePath(root, output, { existing: false });
+    await fs.writeFile(target, JSON.stringify(report, null, 2));
+    await audit({ tool: "analyze_fluency", transcript: transcriptPath, timeline: timelinePath || null, output, findingCount: report.findings.length, removedMs: report.removedMs });
+    return { content: [{ type: "text", text: JSON.stringify({ ...report, outputPath: output }) }] };
+  });
+  register("verify_fluency", "Re-check the current retained word timings against the fluency gate. Fails on hard fillers and long residual pauses; soft particles are reported for semantic review but do not fail automatically.", {
+    transcript: z.string().min(1).default("transcript.json"),
+    timeline: z.string().min(1).default("timeline.json"),
+  }, async ({ transcript: transcriptPath, timeline: timelinePath }) => {
+    const transcript = JSON.parse(await fs.readFile(await workspacePath(root, transcriptPath), "utf8"));
+    const timeline = JSON.parse(await fs.readFile(await workspacePath(root, timelinePath), "utf8"));
+    const result = verifyFluency({ transcript, timeline });
+    await audit({ tool: "verify_fluency", passed: result.passed, issueCount: result.issues.length });
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
   });
   register("compose_remotion_video", "Compose the actual main preview/final from the already-cut baseVideo, timeline.json pieces (src/out in milliseconds), edit-plan.json, transcript.json and captions.srt. Reads the current phase and compositionMode from brief.json. Renders retained events on the EDITED timeline, burns the reviewed SRT, preserves audio, and returns a unique main MP4 plus retained alpha/source/hash evidence. Never use an uncut design comparison as the main video. Inspect the returned outputPath with view_frame and set manifest.main to that exact path, with compositionMode remotion-main.v1.", { baseVideo: z.string().min(1), phase: z.enum(["plan", "chat-edit", "render"]) }, async ({ baseVideo, phase }) => {
     const protectedTranscriptSegmentIds = await protectWorkspacePlan("compose-remotion");

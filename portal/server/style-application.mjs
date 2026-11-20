@@ -30,7 +30,12 @@ function manifestOf(stylePack) {
 }
 
 function referenceOf(stylePack, referenceAnalysis) {
-  return referenceAnalysis || stylePack?.referenceAnalysis || null;
+  const source = referenceAnalysis || stylePack?.referenceAnalysis || null;
+  if (!source) return null;
+  return {
+    ...source,
+    styleSpec: stylePack?.manifest?.styleSpec || source.styleSpec || null,
+  };
 }
 
 function hasBroll(assets = []) {
@@ -118,6 +123,12 @@ function semanticCjkGroups(text, limit) {
   return groups;
 }
 
+function keywordsForGroup(cue, text) {
+  const raw = [cue?.keywords, cue?.highlights].flatMap((value) => Array.isArray(value) ? value : []);
+  const normalized = String(text || "").replace(/\s+/g, "");
+  return [...new Set(raw.map(String).map((value) => value.trim()).filter((value) => value && normalized.includes(value.replace(/\s+/g, ""))))];
+}
+
 export function regroupCaptionCues(cues, maxWordsPerCue) {
   const limit = Math.max(0, Math.min(12, Math.round(Number(maxWordsPerCue) || 0)));
   if (!Array.isArray(cues) || limit < 1) return (cues || []).map((cue) => ({ ...cue }));
@@ -126,6 +137,9 @@ export function regroupCaptionCues(cues, maxWordsPerCue) {
     const endMs = Number(cue.endMs);
     const text = String(cue.text || "").trim();
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs || !text) return [];
+    // The style QC allows three characters of overflow; keep a semantic cue
+    // intact within that tolerance instead of splitting a word or phrase.
+    if (!/\s/.test(text) && Array.from(text).length <= limit + 3) return [{ ...cue, text }];
     const { tokens, spaced } = splitCaptionTokens(text);
     const groups = CJK_PATTERN.test(text) && !spaced
       ? semanticCjkGroups(text, limit)
@@ -134,19 +148,22 @@ export function regroupCaptionCues(cues, maxWordsPerCue) {
           result.at(-1).push(token);
           return result;
         }, []).map((group) => ({ text: group.join(" "), weight: group.length }));
-    const totalWeight = groups.reduce((sum, group) => sum + group.weight, 0);
+    const visibleGroups = groups.filter((group) => /[^\s，。！？；：、,.!?;:]/.test(group.text));
+    const totalWeight = visibleGroups.reduce((sum, group) => sum + group.weight, 0);
     if (!totalWeight) return [];
     const durationMs = endMs - startMs;
     let consumed = 0;
-    return groups.filter((group) => group.text.trim()).map((group, index) => {
+    return visibleGroups.filter((group) => group.text.trim()).map((group, index) => {
       const groupStart = startMs + durationMs * consumed / totalWeight;
       consumed += group.weight;
       const groupEnd = startMs + durationMs * consumed / totalWeight;
+      const keywords = keywordsForGroup(cue, group.text);
       return {
         id: `${String(cue.id || "cue")}-${index + 1}`,
         startMs: Math.round(groupStart),
         endMs: Math.max(Math.round(groupStart) + 1, Math.round(groupEnd)),
         text: group.text.trim(),
+        ...(keywords.length ? { keywords } : {}),
       };
     });
   });

@@ -9,6 +9,7 @@ import {
   validateStyleProject,
 } from "./style-project.mjs";
 import { referenceStyleSpec } from "../test-fixtures/style-spec-v2.mjs";
+import { referenceStyleSpecV3 } from "../test-fixtures/style-spec-v3.mjs";
 
 const validManifest = {
   contract: "style-manifest.v1",
@@ -145,6 +146,39 @@ try {
   assert.equal(styled.manifest.styleSpec.title.panel.opacity, 0.82);
   assert.equal(styled.manifest.styleSpec.captions.motion.enter.scaleFrom, 0.92);
   assert.equal(styled.manifest.styleSpec.effects[0].trigger, "cue_enter");
+
+  const styledV3 = await createDraftStyleProject({
+    analysis: {
+      contract: "reference-analysis.v2",
+      analysisId: "reference-analysis-style-spec-v3",
+      shots: [{ layout: "full", broll: false }],
+      rhythm: { punchInRatio: 0, brollRatio: 0 },
+      captions: { grouping: "phrase", maxWordsPerCue: 10, fontSizeRatio: 0.06, keywordColor: "#ffe45c", position: "bottom" },
+      capabilities: { needsBroll: false },
+      overlays: [
+        { id: "title", type: "title_card", startMs: 0, endMs: 1000 },
+        { id: "identity", type: "identity_card", startMs: 0, endMs: 1000 },
+      ],
+      unsupported: [],
+      confidence: { captions: 0.8 },
+      styleSpec: referenceStyleSpecV3,
+    },
+    outDir: path.join(root, "style-spec-v3"),
+  });
+  assert.equal(styledV3.manifest.contract, "style-manifest.v3");
+  assert.equal(styledV3.manifest.styleSpec.contract, "style-spec.v3");
+  assert.equal(styledV3.manifest.styleSpec.title.primary.fontId, "noto-sans-cjk-sc-black");
+  assert.equal(styledV3.manifest.styleSpec.title.primary.fontWidthScale, 0.92);
+  assert.equal(styledV3.manifest.styleSpec.identity.offsetYRatio, 0.12);
+  assert.equal(styledV3.manifest.styleSpec.identity.maxLines, 4);
+  assert.throws(
+    () => validateStyleManifest({ ...styledV3.manifest, contract: "style-manifest.v2" }),
+    /cannot embed StyleSpec v3/i,
+  );
+  assert.throws(
+    () => validateStyleManifest({ ...styledV3.manifest, styleSpec: referenceStyleSpec }),
+    /requires StyleSpec v3/i,
+  );
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

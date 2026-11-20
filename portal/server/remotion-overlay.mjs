@@ -125,10 +125,13 @@ export async function compositeRemotionPreview({ inputPath, overlayPath, outputP
   await fs.mkdir(dirname(target), { recursive: true });
   await fs.access(target).then(() => { throw new Error("Refusing to overwrite an existing preview output"); }, () => undefined);
   try {
+    const { stdout: inputProbeStdout } = await run("ffprobe", ["-v", "error", "-show_entries", "stream=codec_type", "-of", "json", resolve(inputPath)], portalRoot, 30000);
+    const hasAudio = Boolean(JSON.parse(inputProbeStdout).streams?.some((stream) => stream.codec_type === "audio"));
     const escapedSubtitle = subtitlePath ? resolve(subtitlePath).replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("'", "\\'") : null;
     const color = captionStyle.color.slice(5, 7) + captionStyle.color.slice(3, 5) + captionStyle.color.slice(1, 3);
     const punchIns = punchInWindows(layoutEvents, durationMs);
     const filters = [];
+    if (hasAudio) filters.push("[0:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[aout]");
     let baseLabel = "0:v";
     if (punchIns.length) {
       const sourceLabels = punchIns.map((_, index) => `punchsrc${index}`);
@@ -145,8 +148,8 @@ export async function compositeRemotionPreview({ inputPath, overlayPath, outputP
     await run("ffmpeg", [
       "-y", "-hide_banner", "-i", resolve(inputPath), "-i", resolve(overlayPath),
       "-filter_complex", filters.join(";"),
-      "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", phase === "render" ? "20" : "24",
-      "-c:a", "copy", ...(durationMs ? ["-t", String(durationMs / 1000)] : []), "-shortest", "-movflags", "+faststart", target,
+      "-map", "[v]", "-map", hasAudio ? "[aout]" : "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", phase === "render" ? "20" : "24",
+      "-c:a", hasAudio ? "aac" : "copy", ...(hasAudio ? ["-b:a", "192k"] : []), ...(durationMs ? ["-t", String(durationMs / 1000)] : []), "-shortest", "-movflags", "+faststart", target,
     ], portalRoot);
     const { stdout } = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height", "-of", "json", target], portalRoot, 30000);
     const probe = JSON.parse(stdout);

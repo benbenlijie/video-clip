@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayne.local/contracts/fluency-report.v1.schema.json",
+  "title": "Fluency report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "sourceRanges", "wordCount", "findings", "edits", "proposedPieces", "removedMs"],
+  "properties": {
+    "contract": { "const": "fluency-report.v1" },
+    "sourceRanges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["startMs", "endMs"],
+        "properties": {
+          "startMs": { "type": "number", "minimum": 0 },
+          "endMs": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      }
+    },
+    "wordCount": { "type": "integer", "minimum": 0 },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "type", "startMs", "endMs", "action", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "enum": ["filler", "pause", "slow_window", "false_start"] },
+          "classification": { "type": "string" },
+          "text": { "type": "string" },
+          "startMs": { "type": "number", "minimum": 0 },
+          "endMs": { "type": "number", "exclusiveMinimum": 0 },
+          "action": { "enum": ["remove", "clamp", "review", "keep"] },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "edits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["startMs", "endMs", "reason"],
+        "properties": {
+          "startMs": { "type": "number", "minimum": 0 },
+          "endMs": { "type": "number", "exclusiveMinimum": 0 },
+          "reason": { "type": "string" },
+          "findingId": { "type": "string" }
+        }
+      }
+    },
+    "proposedPieces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["src"],
+        "properties": {
+          "src": {
+            "type": "array",
+            "prefixItems": [{ "type": "number", "minimum": 0 }, { "type": "number", "minimum": 0 }],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      }
+    },
+    "removedMs": { "type": "number", "minimum": 0 },
+    "policy": { "type": "object" }
+  }
+}

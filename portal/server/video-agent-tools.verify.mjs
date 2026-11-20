@@ -8,14 +8,31 @@ import { sandboxCommand, workspacePath } from "./video-agent-tools.mjs";
 
 const root = await fs.mkdtemp(join(os.tmpdir(), "wayne-video-agent-"));
 const audit = join(root, "audit.jsonl");
-const transport = new StdioClientTransport({ command: process.execPath, args: [new URL("./video-agent-tools.mjs", import.meta.url).pathname, root, audit] });
+const transport = new StdioClientTransport({ command: process.execPath, args: [new URL("./video-agent-tools.mjs", import.meta.url).pathname, root, audit], env: { ...process.env, WAYNE_DEEPSEEK_DELEGATION: "off" } });
 const client = new Client({ name: "video-agent-tools-verify", version: "1.0.0" });
 try {
   await client.connect(transport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((item) => item.name).sort(), ["compose_remotion_video", "download_broll", "execute", "read_file", "render_remotion_preview", "search_broll", "view_broll_candidate", "view_frame", "write_file"]);
+  assert.deepEqual(tools.tools.map((item) => item.name).sort(), ["analyze_fluency", "compose_remotion_video", "download_broll", "download_broll_candidate", "execute", "inspect_broll_candidate", "read_file", "render_remotion_preview", "search_broll", "search_broll_sources", "verify_fluency", "view_broll_candidate", "view_frame", "write_file"]);
   assert.deepEqual(tools.tools.find((item) => item.name === "render_remotion_preview")?.inputSchema.properties, {}, "Remotion must use the current workspace plan and fixed paths");
   await assert.rejects(workspacePath(root, "../escape"), /inside the edit workspace/);
+  await fs.writeFile(join(root, "transcript.json"), JSON.stringify({
+    text: "你好呃世界",
+    segments: [{ id: "fluency", startMs: 0, endMs: 2000, text: "你好呃世界", words: [
+      { startMs: 0, endMs: 400, text: "你好" },
+      { startMs: 900, endMs: 1100, text: "呃" },
+      { startMs: 1300, endMs: 1900, text: "世界" },
+    ] }],
+  }));
+  const fluencyWithoutTimeline = await client.callTool({ name: "analyze_fluency", arguments: { transcript: "transcript.json" } });
+  assert.equal(fluencyWithoutTimeline.isError, undefined, JSON.stringify(fluencyWithoutTimeline));
+  assert.deepEqual(JSON.parse(fluencyWithoutTimeline.content[0].text).sourceRanges, [{ startMs: 0, endMs: 2000 }], "a new project must be analyzable before timeline.json exists");
+  await fs.writeFile(join(root, "timeline.json"), JSON.stringify({ pieces: [{ src: [0, 2000], out: [0, 2000] }] }));
+  const fluency = await client.callTool({ name: "analyze_fluency", arguments: { transcript: "transcript.json", timeline: "timeline.json" } });
+  assert.equal(fluency.isError, undefined, JSON.stringify(fluency));
+  assert.match(fluency.content[0].text, /hard-filler/);
+  const fluencyVerify = await client.callTool({ name: "verify_fluency", arguments: { transcript: "transcript.json", timeline: "timeline.json" } });
+  assert.match(fluencyVerify.content[0].text, /"passed":false/);
   const protectedTranscript = { segments: [{ id: "corrected-line", startMs: 250, endMs: 750, text: "校对后的句子", wordTimingStatus: "protected" }] };
   await fs.writeFile(join(root, "transcript.json"), JSON.stringify(protectedTranscript));
   const partialPlan = { segments: [

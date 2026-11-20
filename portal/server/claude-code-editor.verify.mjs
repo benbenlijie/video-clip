@@ -20,6 +20,9 @@ assert.match(prompt, /wordTimingStatus=estimated/);
 assert.match(prompt, /If wordTimingStatus=protected/);
 assert.match(prompt, /does not need to provide extra instructions/);
 assert.match(prompt, /never split a word, complete noun/);
+assert.match(prompt, /analyze_fluency/);
+assert.match(prompt, /verify_fluency/);
+assert.match(prompt, /fluency-report\.json/);
 assert.match(buildEditorPrompt("plan", "remotion-main.v1"), /compose_remotion_video/);
 assert.doesNotMatch(buildEditorPrompt("plan", "remotion-main.v1"), /use mcp__video__render_remotion_preview/);
 assert.match(buildEditorPrompt("plan", "remotion-main.v1", { hasStylePack: true }), /style-transfer\.json/);
@@ -88,6 +91,21 @@ try {
   assert.equal(reusableTransfer.stylePackId, "style-reuse-test");
   assert.equal(reusableTransfer.rules.doNotReuseReferenceTranscript, true);
   assert.equal(reusableTransfer.styleSpec.captions.maxCharsPerCue, 8);
+  const resumeProject = {
+    ...project,
+    compositionMode: "remotion-main.v1",
+    primaryTranscript: structuredClone(project.transcript),
+    proofreading: { status: "pending", changes: [], unresolved: [] },
+  };
+  await writeFile(join(dir, "transcript.json"), JSON.stringify({ ...project.transcript, text: "把繁琐的", segments: [{ ...project.transcript.segments[0], text: "把繁琐的" }] }));
+  await writeFile(join(dir, "transcript-proofread.json"), JSON.stringify({ status: "ready", changes: [], unresolved: [], transcript: { ...project.transcript, text: "把繁琐的" } }));
+  await prepareWorkspace(resumeProject, "plan");
+  assert.equal(JSON.parse(await readFile(join(dir, "transcript.json"), "utf8")).text, "把繁琐的", "an interrupted plan keeps its validated transcript instead of overwriting it with the original");
+  assert.equal(JSON.parse(await readFile(join(dir, "transcript-proofread.json"), "utf8")).status, "ready", "a pending project marker must not overwrite the completed worker proofreading report");
+  assert.ok(JSON.parse(await readFile(join(dir, "brief.json"), "utf8")).resumeArtifacts.includes("transcript-proofread.json"));
+  const editedProject = { ...resumeProject, transcript: { ...project.transcript, text: "用户改的", segments: [{ ...project.transcript.segments[0], text: "用户改的" }] } };
+  await prepareWorkspace(editedProject, "plan");
+  assert.equal(JSON.parse(await readFile(join(dir, "transcript.json"), "utf8")).text, "用户改的", "explicit user transcript edits override a stale worker transcript");
   console.log("claude-code-editor.verify: skill paths, prompt contract, and refresh behavior passed");
 } finally {
   await rm(root, { recursive: true, force: true });

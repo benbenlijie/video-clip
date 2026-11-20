@@ -60,8 +60,13 @@ try {
     outDir: projectDirV2,
     manifest: { ...manifest, version: 2, status: "pending_approval" },
   });
+  await fs.appendFile(path.join(projectDirV2, "style-manifest.json"), "\n");
   const savedV2 = await saveStylePack({ root, manifest: version2.manifest, projectDir: projectDirV2, status: "pending_approval" });
   assert.equal(savedV2.version, 2);
+  assert.equal(
+    await fs.readFile(path.join(root, "styles", manifest.id, "v2", "style-manifest.json"), "utf8"),
+    await fs.readFile(path.join(root, "styles", manifest.id, "v2", "style-project", "style-manifest.json"), "utf8"),
+  );
   assert.equal((await loadStylePack(manifest.id, 2, { root })).version, 2);
   assert.equal((await rejectStylePack(manifest.id, 2, { root, reason: "caption too large" })).status, "rejected");
   await assert.rejects(approveStylePack(manifest.id, 2, { root }), /cannot be approved|rejected|status/i);

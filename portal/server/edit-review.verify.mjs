@@ -65,7 +65,7 @@ try {
   const tools = await client.listTools();
   assert.deepEqual(
     tools.tools.map((item) => item.name).sort(),
-    ["analyze_edit", "compare_edits", "extract_contact_sheet", "view_frame", "write_review_report"],
+    ["analyze_edit", "compare_edits", "extract_contact_sheet", "view_frame", "view_frame_region", "write_review_report"],
   );
 
   const analysis = jsonResult(await client.callTool({
@@ -104,6 +104,21 @@ try {
   });
   assert.equal(frame.content[1].type, "image");
   assert.equal(frame.content[1].mimeType, "image/jpeg");
+
+  const regionFrame = await client.callTool({
+    name: "view_frame_region",
+    arguments: {
+      video: "b.mp4",
+      timeSeconds: 1,
+      region: { x: 0.1, y: 0.1, width: 0.5, height: 0.3 },
+      scale: 2,
+    },
+  });
+  assert.equal(regionFrame.content[1].type, "image");
+  assert.equal(regionFrame.content[1].mimeType, "image/png");
+  const regionMeta = jsonResult(regionFrame);
+  assert.equal(regionMeta.output.scale, 2);
+  assert.ok(regionMeta.output.width > regionMeta.cropPx.width);
 
   const dimensionsA = [
     dimension("rhythmAndShots", 3, "A", 1),

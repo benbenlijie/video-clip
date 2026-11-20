@@ -16,6 +16,7 @@ import { applyTranscriptReview, ensureTranscriptReviewState } from "./transcript
 import { subtitlesMatchTranscript, transcriptFingerprint } from "./transcript-proofreading.mjs";
 import { editWithClaudeCode, editorState } from "./claude-code-editor.mjs";
 import { brollProviderState, searchOnlineBroll } from "./broll-search.mjs";
+import { downloadBrollCandidate } from "./video-broll-tools.mjs";
 import { appendEditTurn, buildChatContext, completeEditTurn, createEditSession, failEditTurn } from "./edit-chat.mjs";
 import { createRenderManifest, getEngineAvailability, toTimelineV1 } from "./timeline-contract.mjs";
 import { compositeRemotionPreview, remotionRuntimeAvailable, renderRemotionOverlay } from "./remotion-overlay.mjs";
@@ -37,11 +38,12 @@ import { hashStyleProject } from "./style-project.mjs";
 import { assertReferenceStyleCapability, assertStyleExportAllowed, referenceStyleConfig } from "./style-rollout.mjs";
 import { runReferenceStyleAgent } from "./reference-style-editor.mjs";
 import { REFERENCE_MIN_SECONDS, deleteWechatSource, ingestWechatSource, pruneWechatSources, readWechatSource, resolveWechatLink, trimReferenceClip } from "./wechat-ingest.mjs";
+import { deepSeekDelegationMode } from "./deepseek-delegate.mjs";
 
 try {
   if (process.env.WAYNE_IGNORE_DOTENV === "1") throw new Error("portal .env disabled for isolated verification");
   const envText = await fs.readFile(new URL("../.env", import.meta.url), "utf8");
-  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE", "WAYNE_WHISPER_CLI_PATH", "WAYNE_WHISPER_MODEL_PATH", "WAYNE_WHISPER_THREADS", "WAYNE_WHISPER_TIMEOUT_MS", "REFERENCE_STYLE_ENABLED", "REFERENCE_STYLE_STAGE", "REFERENCE_STYLE_VISUAL_ANALYSIS", "REFERENCE_STYLE_AUDIO_ANALYSIS", "REFERENCE_ANALYSIS_MODEL", "REFERENCE_ANALYSIS_TIMEOUT_MS", "WAYNE_AUDIO_ANALYSIS_PYTHON", "WAYNE_STYLE_DIR", "WAYNE_STYLE_GENERATOR", "WAYNE_STYLE_AGENT", "WAYNE_FACE_DETECTOR_PYTHON", "REMOTION_BROWSER_EXECUTABLE"]);
+  const portalKeys = new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_ANTHROPIC_API_KEY", "PEXELS_API_KEY", "PIXABAY_API_KEY", "OPENCHATCUT_MCP_URL", "OPENCHATCUT_MCP_TOKEN", "TRANSCRIPTION_PROVIDER", "VOLCENGINE_ASR_MODE", "VOLCENGINE_ASR_API_KEY", "VOLCENGINE_ASR_RESOURCE_ID", "VOLCENGINE_ASR_BASE_URL", "VOLCENGINE_ASR_MODEL", "VOLCENGINE_ASR_PUBLIC_BASE_URL", "VOLCENGINE_APP_ID", "VOLCENGINE_ACCESS_TOKEN", "VOLCENGINE_ASR_CLUSTER", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY", "TENCENTCLOUD_REGION", "TENCENTCLOUD_ASR_ENDPOINT", "TENCENTCLOUD_ASR_ENGINE_MODEL_TYPE", "WAYNE_WHISPER_CLI_PATH", "WAYNE_WHISPER_MODEL_PATH", "WAYNE_WHISPER_THREADS", "WAYNE_WHISPER_TIMEOUT_MS", "WAYNE_EDIT_PLAN_BUDGET_USD", "WAYNE_EDIT_RENDER_BUDGET_USD", "WAYNE_DEEPSEEK_DELEGATION", "WAYNE_DSH_BIN", "WAYNE_DSH_PROFILE", "WAYNE_DEEPSEEK_DELEGATE_TIMEOUT_MS", "REFERENCE_STYLE_ENABLED", "REFERENCE_STYLE_STAGE", "REFERENCE_STYLE_VISUAL_ANALYSIS", "REFERENCE_STYLE_AUDIO_ANALYSIS", "REFERENCE_ANALYSIS_MODEL", "REFERENCE_ANALYSIS_TIMEOUT_MS", "WAYNE_AUDIO_ANALYSIS_PYTHON", "WAYNE_STYLE_DIR", "WAYNE_STYLE_GENERATOR", "WAYNE_STYLE_AGENT", "WAYNE_FACE_DETECTOR_PYTHON", "REMOTION_BROWSER_EXECUTABLE"]);
   for (const line of envText.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
     if (match && portalKeys.has(match[1])) process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
@@ -54,6 +56,7 @@ const referenceStylesRoot = join(store.root, "reference-styles");
 const styleLibraryRoot = resolve(process.env.WAYNE_STYLE_DIR || join(root, "style-library"));
 const subscribers = new Map();
 const brollSearchRequests = new Map();
+const brollCandidates = new Map();
 const activeTranscriptions = new Set();
 const activeAssetAnalyses = new Set();
 const assetUploadLocks = new Map();
@@ -161,6 +164,7 @@ function configState() {
     localWhisper: { available: whisper.available, model: whisper.model, threads: whisper.threads },
     ffmpeg: true,
     engines: availableEngines(),
+    delegation: { provider: "deepseek-harness", mode: deepSeekDelegationMode(), profile: process.env.WAYNE_DSH_PROFILE || "headless" },
     brollProviders: brollProviderState(),
     referenceStyle: { ...referenceStyleRollout, engine: styleAgentEngine },
     mode: allConfigured ? "configured" : anthropic || transcription.any ? "partial" : "demo",
@@ -405,6 +409,34 @@ function allowBrollSearch(req) {
     while (brollSearchRequests.size > 5000) brollSearchRequests.delete(brollSearchRequests.keys().next().value);
   }
   return true;
+}
+
+const BROLL_CANDIDATE_TTL_MS = 30 * 60 * 1000;
+const MAX_PROJECT_BROLL_ASSETS = 12;
+
+function rememberBrollCandidates(projectId, result) {
+  const now = Date.now();
+  for (const [handle, entry] of brollCandidates) if (now - entry.createdAt >= BROLL_CANDIDATE_TTL_MS) brollCandidates.delete(handle);
+  return {
+    ...result,
+    scenes: result.scenes.map((scene) => ({
+      ...scene,
+      candidates: scene.candidates.map((candidate) => {
+        const candidateHandle = randomUUID();
+        brollCandidates.set(candidateHandle, { projectId, candidate, createdAt: now });
+        return { ...candidate, candidateHandle };
+      }),
+    })),
+  };
+}
+
+function brollCandidateForProject(projectId, candidateHandle) {
+  const entry = brollCandidates.get(candidateHandle);
+  if (!entry || entry.projectId !== projectId || Date.now() - entry.createdAt >= BROLL_CANDIDATE_TTL_MS) {
+    if (entry) brollCandidates.delete(candidateHandle);
+    throw new Error("B-roll 候选句柄无效或已过期，请重新搜索");
+  }
+  return entry.candidate;
 }
 
 async function withAssetUploadLock(key, operation) {
@@ -1095,7 +1127,7 @@ async function handle(req, res) {
           layoutEvents,
           styleParams: targetProject.plan.styleParameters || targetProject.styleParameters || {},
           captionStyle: normalizedCaptionStyle,
-          styleSpec: targetProject.referenceAnalysis?.styleSpec || targetProject.stylePack?.manifest?.styleSpec || null,
+          styleSpec: targetProject.stylePack?.manifest?.styleSpec || targetProject.referenceAnalysis?.styleSpec || null,
         },
       });
       const name = `style-preview-${randomUUID().slice(0, 8)}.mp4`;
@@ -1504,10 +1536,70 @@ async function handle(req, res) {
       const body = await readJson(req);
       const text = String(body.text || project.transcript?.text || project.goal || "");
       const result = await searchOnlineBroll({ text, orientation: body.orientation || "landscape", cachePath: join(root, "storage", ".broll-search-cache.json") });
-      return json(res, 200, result);
+      return json(res, 200, rememberBrollCandidates(project.id, result));
     } catch (error) {
       const status = error.statusCode || (/未配置/.test(error.message) ? 503 : /请提供/.test(error.message) ? 400 : 502);
       return json(res, status, { error: error.message, providers: brollProviderState() });
+    }
+  }
+  if (req.method === "POST" && segments[3] === "broll" && segments[4] === "import") {
+    if (project.workflowMode === "multi-asset-v1") return json(res, 409, { error: "多素材项目请把 B-roll 作为视频素材上传到素材库" });
+    if (["planning", "rendering", "rendering_preview", "chat_editing"].includes(project.status)) return json(res, 409, { error: "项目正在处理，请稍后再添加 B-roll" });
+    let downloadedPath = null;
+    try {
+      return await withAssetUploadLock(`${project.id}:broll-import`, async () => {
+        const body = await readJson(req);
+        const candidateHandle = String(body.candidateHandle || "");
+        if (!/^[a-f0-9-]{36}$/i.test(candidateHandle)) throw new Error("B-roll 候选句柄无效或已过期，请重新搜索");
+        const candidate = brollCandidateForProject(project.id, candidateHandle);
+        if ((project.brollAssets || []).length >= MAX_PROJECT_BROLL_ASSETS) throw new Error(`每个项目最多添加 ${MAX_PROJECT_BROLL_ASSETS} 个 B-roll 素材`);
+        const duplicate = (project.brollAssets || []).find((asset) => asset.provider === candidate.provider && String(asset.providerId) === String(candidate.providerId));
+        if (duplicate) throw new Error("这个 B-roll 候选已经加入项目");
+        const downloaded = await downloadBrollCandidate({
+          candidate,
+          workspaceDir: project.dir,
+          fileStem: `broll-${candidate.provider}-${String(candidate.providerId).replace(/[^a-z0-9]/gi, "")}`,
+        });
+        downloadedPath = join(project.dir, downloaded.path);
+        if ((project.brollAssets || []).some((asset) => asset.sha256 === downloaded.sha256)) {
+          await fs.rm(downloadedPath, { force: true });
+          downloadedPath = null;
+          throw new Error("这个 B-roll 文件已经加入项目");
+        }
+        const asset = {
+          id: downloaded.assetId,
+          filename: downloaded.filename,
+          title: String(candidate.title || downloaded.filename),
+          path: downloadedPath,
+          durationMs: downloaded.durationMs,
+          width: downloaded.width,
+          height: downloaded.height,
+          licenseConfirmed: true,
+          provider: downloaded.provider,
+          providerId: downloaded.providerId,
+          sourceUrl: downloaded.sourceUrl,
+          creator: downloaded.creator || null,
+          creatorUrl: downloaded.creatorUrl || null,
+          licenseName: downloaded.licenseName,
+          licenseUrl: downloaded.licenseUrl,
+          sha256: downloaded.sha256,
+          bytes: downloaded.bytes,
+          downloadedAt: downloaded.downloadedAt,
+        };
+        project.brollAssets = [...(project.brollAssets || []), asset];
+        project.plan = null;
+        project.qc = null;
+        project.error = null;
+        if (project.transcript) project.status = "transcript_ready";
+        await save(project);
+        downloadedPath = null;
+        brollCandidates.delete(candidateHandle);
+        publish(project.id, { type: "broll", status: project.status, message: "在线 B-roll 已加入项目；请重新生成完整成片" });
+        return json(res, 201, projectView(project));
+      });
+    } catch (error) {
+      if (downloadedPath) await fs.rm(downloadedPath, { force: true }).catch(() => undefined);
+      return json(res, error.statusCode || 400, { error: error.message });
     }
   }
   if (req.method === "POST" && segments[3] === "music") {

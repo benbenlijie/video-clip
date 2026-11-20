@@ -25,6 +25,14 @@ try {
   const unavailableSearch = await fetch(`${base}/api/projects/${project.id}/broll/search`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "someone working late at night" }) });
   assert.equal(unavailableSearch.status, 503, "missing stock-provider keys should be reported before any paid Claude request");
   assert.deepEqual((await unavailableSearch.json()).providers, { pexels: false, pixabay: false });
+  const unknownCandidate = await fetch(`${base}/api/projects/${project.id}/broll/import`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ candidateHandle: "00000000-0000-4000-8000-000000000000" }) });
+  assert.equal(unknownCandidate.status, 400);
+  assert.match((await unknownCandidate.json()).error, /候选.*无效|过期/);
+  const arbitraryUrl = await fetch(`${base}/api/projects/${project.id}/broll/import`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ downloadUrl: "https://example.com/arbitrary.mp4" }) });
+  assert.equal(arbitraryUrl.status, 400, "the browser cannot submit an arbitrary B-roll URL");
+  const multiProject = await (await fetch(`${base}/api/projects`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workflowMode: "multi-asset-v1", goal: "multi B-roll import" }) })).json();
+  const multiImport = await fetch(`${base}/api/projects/${multiProject.id}/broll/import`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ candidateHandle: "00000000-0000-4000-8000-000000000000" }) });
+  assert.equal(multiImport.status, 409);
 
   const musicPath = path.join(root, "licensed-bed.wav");
   const generated = spawnSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "pcm_s16le", musicPath], { encoding: "utf8" });

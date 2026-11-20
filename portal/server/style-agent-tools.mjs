@@ -78,7 +78,9 @@ const panelSpecSchema = z.object({
   blurPx: z.number().min(0).max(40),
 }).strict();
 const typographySpecSchema = z.object({
-  fontFamily: z.enum(["sans", "serif", "display", "rounded"]),
+  fontFamily: z.string().regex(/^[A-Za-z0-9 ,'"_\-]{1,120}$/),
+  fontId: z.string().regex(/^[a-z0-9][a-z0-9-]{2,80}$/).optional(),
+  fontWidthScale: z.number().min(0.7).max(1.3).optional(),
   fontWeight: z.number().int().min(300).max(900),
   fontSizeRatio: z.number().min(0.01).max(0.2),
   lineHeight: z.number().min(0.8).max(2),
@@ -105,7 +107,7 @@ const motionSpecSchema = z.object({
   exit: animationSpecSchema,
 }).strict();
 const styleSpecSchema = z.object({
-  contract: z.literal("style-spec.v2"),
+  contract: z.enum(["style-spec.v2", "style-spec.v3"]),
   canvas: z.object({
     aspectRatio: z.enum(["9:16", "16:9"]),
     safeArea: z.object({
@@ -131,6 +133,8 @@ const styleSpecSchema = z.object({
       "bottom_left", "bottom_center", "bottom_right",
     ]),
     maxWidthRatio: z.number().min(0.2).max(0.8),
+    offsetYRatio: z.number().min(-0.3).max(0.3).optional(),
+    maxLines: z.number().int().min(1).max(6).optional(),
     panel: panelSpecSchema,
     primary: typographySpecSchema,
     secondary: typographySpecSchema,
@@ -329,7 +333,7 @@ export async function startStyleTools(workDir, auditPath, { styleRoot = process.
     return { content: [{ type: "text", text: JSON.stringify(audio) }] };
   });
 
-  register("write_reference_analysis", "Persist Claude's visual facts and the detailed StyleSpec v2. MCP injects source, audio, rhythm, analysisId and contract from probe/audio/shots files; Claude supplies shots, captions, overlays, capabilities, unsupported, confidence, and styleSpec.", {
+  register("write_reference_analysis", "Persist Claude's visual facts and the detailed StyleSpec v2/v3. MCP injects source, audio, rhythm, analysisId and contract from probe/audio/shots files; Claude supplies shots, captions, overlays, capabilities, unsupported, confidence, and styleSpec.", {
     shots: z.array(shotVisualSchema).optional(),
     captions: captionVisualSchema.optional(),
     overlays: z.array(overlayVisualSchema).optional(),

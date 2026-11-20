@@ -119,6 +119,7 @@ function deriveContentCopy({ transcript, sourceFilename, title, subtitle, identi
     subtitle: trimText(explicitSubtitle || spoken[1] || "", 28),
     identity: trimText(explicitIdentity || detectedIdentity, 20),
     identitySubtext: trimText(identitySubtext || "", 32),
+    keywords: [],
     source: explicitTitle || explicitIdentity ? "explicit" : spoken.length ? "transcript" : "filename",
   };
 }
@@ -205,9 +206,18 @@ export async function runStylePreview({
   await fs.copyFile(basePath, inputCopyPath);
   const clipProbe = await probeReferenceMedia(basePath);
   const transcript = await readTranscript(transcriptPath, basePath, workDir);
-  const copy = copyPath
-    ? { contract: "content-copy.v1", ...JSON.parse(await fs.readFile(resolve(copyPath), "utf8")), source: "explicit_file" }
-    : deriveContentCopy({ transcript, sourceFilename: sourcePath, title, subtitle, identity, identitySubtext });
+  let copy;
+  if (copyPath) {
+    const provided = JSON.parse(await fs.readFile(resolve(copyPath), "utf8"));
+    copy = {
+      contract: "content-copy.v1",
+      ...provided,
+      keywords: [...new Set((provided.keywords || []).map(String).map((value) => value.trim()).filter(Boolean))],
+      source: "explicit_file",
+    };
+  } else {
+    copy = deriveContentCopy({ transcript, sourceFilename: sourcePath, title, subtitle, identity, identitySubtext });
+  }
   const media = {
     filename: basename(sourcePath),
     durationMs: clipProbe.durationMs,
@@ -275,6 +285,7 @@ export async function runStylePreview({
     styleCompositionId: "ReferenceStyle",
     styleApplication: application,
     styleApplicationHash,
+    styleSpec: pack.manifest.styleSpec || null,
     media,
     styleParameters,
     referenceAnalysisPath: "reference-analysis.json",
@@ -283,6 +294,7 @@ export async function runStylePreview({
   await Promise.all([
     fs.writeFile(join(workDir, "brief.json"), JSON.stringify(brief, null, 2)),
     fs.writeFile(join(workDir, "transcript.json"), JSON.stringify(transcript, null, 2)),
+    fs.writeFile(join(workDir, "content-copy.json"), JSON.stringify(copy, null, 2)),
     fs.writeFile(join(workDir, "edit-plan.json"), JSON.stringify(plan, null, 2)),
     fs.writeFile(join(workDir, "timeline.json"), JSON.stringify({
       pieces: [{ src: [0, clipProbe.durationMs], out: [0, clipProbe.durationMs] }],

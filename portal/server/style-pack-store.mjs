@@ -73,6 +73,7 @@ export async function saveStylePack({ project = null, manifest, projectDir, stat
     const manifestPath = join(target, "style-manifest.json");
     const manifestText = JSON.stringify(normalized, null, 2);
     await fs.writeFile(manifestPath, manifestText, { flag: "wx" });
+    await fs.writeFile(join(target, "style-project", "style-manifest.json"), manifestText);
     const manifestSha256 = hashBytes(Buffer.from(manifestText));
     const codeSha256 = await hashStyleProject(join(target, "style-project"));
     const approval = {

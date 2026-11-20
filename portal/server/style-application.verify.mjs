@@ -269,9 +269,18 @@ assert.deepEqual(regroupedZh.map((cue) => cue.text), ["用户", "自己的开场
 assert.equal(regroupedZh[0].startMs, 0);
 assert.equal(regroupedZh.at(-1).endMs, 1100);
 const semanticNounZh = regroupCaptionCues([{ id: "noun", startMs: 0, endMs: 2000, text: "就能直接分割保單的現金價值" }], 10);
-assert.deepEqual(semanticNounZh.map((cue) => cue.text), ["就能直接", "分割保單的現金價值"]);
+assert.deepEqual(semanticNounZh.map((cue) => cue.text), ["就能直接分割保單的現金價值"]);
 const semanticPhraseZh = regroupCaptionCues([{ id: "phrase", startMs: 0, endMs: 2000, text: "最近找我咨询的朋友越来越多" }], 10);
-assert.deepEqual(semanticPhraseZh.map((cue) => cue.text), ["最近找我咨询的朋友", "越来越多"]);
+assert.deepEqual(semanticPhraseZh.map((cue) => cue.text), ["最近找我咨询的朋友越来越多"]);
+const keywordCues = regroupCaptionCues([{
+  id: "keyword",
+  startMs: 0,
+  endMs: 2000,
+  text: "掌握保单现金价值",
+  keywords: ["保单", "现金价值"],
+}], 10);
+assert.deepEqual(keywordCues.map((cue) => cue.text), ["掌握保单现金价值"]);
+assert.deepEqual(keywordCues[0].keywords, ["保单", "现金价值"]);
 const regroupedEn = regroupCaptionCues([{ id: "en", startMs: 0, endMs: 1000, text: "one two three four five" }], 2);
 assert.deepEqual(regroupedEn.map((cue) => cue.text), ["one two", "three four", "five"]);
 assert.equal(regroupedEn.map((cue) => cue.text).join(" "), "one two three four five");

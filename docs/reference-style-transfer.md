@@ -139,7 +139,8 @@ brief 生成，至少包含：
   "title": "从用户内容提炼的标题",
   "subtitle": "从用户内容提炼的副标题",
   "identity": "",
-  "identitySubtext": ""
+  "identitySubtext": "",
+  "keywords": ["当前视频中真正需要强调的词"]
 }
 ```
 
@@ -263,9 +264,15 @@ POST /api/style-packs/:id/:version/approve
 POST /api/style-packs/:id/:version/reject
 POST /api/projects/:id/apply-style
 POST /api/projects/:id/style-preview
+POST /api/projects/:id/broll/import
 ```
 
 API 只返回服务端投影，不返回生成代码执行结果、本地绝对路径或凭据。
+
+在线 B-roll 搜索结果会返回短期 `candidateHandle`。网页只能把该句柄提交给
+`broll/import`，由服务端再次执行官方 CDN 白名单、100MB 大小限制、单次安全重定向
+和 FFprobe 媒体校验；浏览器不能直接提交任意下载 URL。导入会保存 provider、
+来源页、许可和 SHA-256，并使旧剪辑计划与旧 QC 失效，必须重新生成计划后才可导出。
 
 ## Style QC
 

@@ -134,20 +134,30 @@ export function computeStyleMetrics({ referenceAnalysis, userFacts, copy = {} } 
   const user = userFacts || {};
   const rhythm = copy.copyRhythm === false ? {} : reference.rhythm || {};
   const captions = copy.copyCaptions === false ? {} : reference.captions || {};
+  const styledCaptions = copy.copyCaptions === false ? null : reference.styleSpec?.captions || null;
   const layout = copy.copyLayout === false ? {} : reference.rhythm || {};
   const audio = copy.copyAudio === false ? {} : reference.audio || {};
   const referenceDurationMs = Math.max(1, finite(reference.source?.durationMs, 0));
   const userDurationMs = Math.max(1, finite(user.durationMs, 0));
   const shortPreview = userDurationMs * 2 < referenceDurationMs;
+  // A single-shot reference has no editorial cut rhythm to transfer; jump cuts
+  // made to remove pauses should not be treated as a style mismatch.
+  const rhythmComparable = Array.isArray(reference.shots) ? reference.shots.length > 1 : true;
   return {
-    cutDensityDelta: metricDelta(user.cutsPerMinute, rhythm.cutsPerMinute),
-    avgShotLengthDelta: shortPreview ? null : metricDelta(user.avgShotMs, rhythm.avgShotMs),
-    hookLengthDelta: shortPreview ? null : metricDelta(user.hookMs, rhythm.hookMs),
+    cutDensityDelta: rhythmComparable ? metricDelta(user.cutsPerMinute, rhythm.cutsPerMinute) : null,
+    avgShotLengthDelta: shortPreview || !rhythmComparable ? null : metricDelta(user.avgShotMs, rhythm.avgShotMs),
+    hookLengthDelta: shortPreview || !rhythmComparable ? null : metricDelta(user.hookMs, rhythm.hookMs),
     punchInRatioDelta: metricDelta(user.punchInRatio, layout.punchInRatio),
     brollRatioDelta: copy.copyBroll === false ? null : metricDelta(user.brollRatio, rhythm.brollRatio),
-    captionWordsPerCueDelta: metricDelta(user.maxWordsPerCue, captions.maxWordsPerCue),
+    captionWordsPerCueDelta: metricDelta(
+      user.maxWordsPerCue,
+      styledCaptions?.maxCharsPerCue ?? captions.maxWordsPerCue,
+    ),
     captionPositionDelta: positionDelta(user.captionPosition, captions.position),
-    captionFontRatioDelta: metricDelta(user.captionFontRatio, captions.fontSizeRatio),
+    captionFontRatioDelta: metricDelta(
+      user.captionFontRatio,
+      styledCaptions?.typography?.fontSizeRatio ?? captions.fontSizeRatio,
+    ),
     visualEventRateDelta: copy.copyLayout === false || shortPreview
       ? null
       : metricDelta(user.visualEventRate, (reference.overlays || []).length / Math.max(1, reference.source?.durationMs || 1) * 60000),

@@ -19,6 +19,8 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 这些规则吸收了公开的 MIT/Apache-2.0 项目经验，但不复制它们的品牌、字体、模板或外部素材流程。当前工作区的输入输出、MCP 工具和服务器 QC 是最终契约。
 
+如果 `brief.json.resumeArtifacts` 非空，表示当前工作区是上次中断后保留的现场。先验证其中已有的校对转录、剪辑脚本、基础视频、时间线和字幕；输入未变化且校验通过时复用，只重做缺失或受影响的下游步骤，禁止无理由从转录或 B-roll 搜索重新开始。
+
 ## 复用 StylePack
 
 `style-transfer.json` 存在时，它描述的是可跨项目复用的视觉语法，不是当前参考视频的内容。必须：
@@ -33,11 +35,12 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 标题、副标题、身份卡和 CTA 必须来自当前用户的转录、真实画面、文件名或用户 brief。
 在写 `edit-plan.json` 之前先写 `content-copy.json`，格式为
-`{"contract":"content-copy.v1","title":"","subtitle":"","identity":"","identitySubtext":"","cta":"","evidence":{}}`。
+`{"contract":"content-copy.v1","title":"","subtitle":"","identity":"","identitySubtext":"","cta":"","keywords":[],"evidence":{}}`。
 每个非空字段必须在 `evidence` 中记录依据：`transcript`、`frame`、`filename` 或
 `brief`。禁止把“风格预览”“用户自己的标题”“用户身份信息”“口播样片”“6 秒预览”
 等技术占位文案写进正式预览或成片。找不到可信身份就省略身份区，不能编造人物姓名、
-职业或品牌。`edit-plan.json.visualEvents` 的文案应从 `content-copy.json` 取值，并把
+职业或品牌。`keywords` 只能放当前用户内容里真实出现、值得金色强调的词；
+`edit-plan.json.visualEvents` 的文案应从 `content-copy.json` 取值，并把
 `content-copy.json` 列入 `manifest.sources` 以便追溯。
 
 ## 主视频制作方式
@@ -55,11 +58,17 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 
 ## 工具与隔离环境
 
+- `mcp__video__delegate_task`：把一个有边界的执行任务交给本地 DeepSeek Harness。只传明确的输入、输出、约束和验收条件；适合转录统计、剪辑 EDL、FFmpeg/Python 脚本、字幕时间映射、文件哈希和 QC 命令。把同一阶段的命令批成一个任务，避免每条命令都启动一次 worker。执行完成后必须读取它的输出并验收，不能把最终 Hook、视觉层级、B-roll 选片和审片决定外包。`force` 模式下，所有 shell、媒体生成和普通文件写入都必须经过此工具；只允许直接写 `edit-plan.json`、`content-copy.json` 和 `manifest.json`。
 - `mcp__video__execute`：离线 Linux shell。可写目录只有 `/work`；FFmpeg、FFprobe、Python、Node 和已安装的 HyperFrames 可用。禁止安装包、访问任意外网或读取工作区外文件。
 - `mcp__video__search_broll`：对 9:16 口播默认先评估 1–3 个具体场景意图。没有产品 UI 时，仍可使用与口播语义匹配的通用剪辑、工作流、键盘、素材整理等画面；只有会误导事实或没有任何视觉增量时才跳过。
 - `mcp__video__view_broll_candidate`：下载前必须查看候选缩略图和许可信息。
 - `mcp__video__download_broll`：只下载紧接着搜索得到并审查过的候选；一轮最多 3 个。任何 `brollEvents` 只能引用实际下载的素材。
+- `mcp__video__search_broll_sources`：补搜 Mixkit、Coverr 和影视飓风。Mixkit 的 Restricted 720p 只能个人使用；影视飓风只返回官方详情和授权规格，不自动登录或下单。
+- `mcp__video__inspect_broll_candidate`：查看多源候选的真实缩略图；不可只凭标题和许可证文字选片。
+- `mcp__video__download_broll_candidate`：下载已审查候选并返回 ffprobe/SHA-256。影视飓风必须由用户提供官网 0 元订单后的百度网盘分享链接；不得把分享链接写入日志或发给第三方。
 - `mcp__video__write_file` / `mcp__video__read_file`：管理脚本、字幕、HyperFrames 源码、计划和报告。
+- `mcp__video__analyze_fluency`：读取逐词时间轴和当前 timeline，写出 `fluency-report.json`，返回可执行 `proposedPieces`。
+- `mcp__video__verify_fluency`：在渲染前复查残留硬填充词和长停顿；不能把软语气词无脑删除。
 - `mcp__video__view_frame`：真实视觉审片。不能用 FFmpeg 退出码、文件大小或文字描述代替。
 - `mcp__video__compose_remotion_video`：新模式下真正合成主视频；输出不可替换为独立对照，真实合成记录必须能与主视频绑定。
 - `mcp__video__render_remotion_preview`：从当前 `input.mp4`、`brief.json` 和已校验的 `edit-plan.json` 生成 Remotion 动效对照预览；不接受路径或代码参数。预览只用于比较视觉样式，不替代 Wayne 正式草剪或终稿。
@@ -73,6 +82,18 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
 读取逐词时间戳：忽略负时间的占位项，保留完整单词和完整语义。删除停顿、口误和明显重录，但不要为了追求快而切碎句子。ASR 不确定时保留原词或在报告中标注，不得编造事实。
 
 计划阶段收到 `transcript.original.json` 和 `transcript.whisper.json` 时，在同一次计划调用中比较两份 ASR 文本并输出 `transcript-proofread.json`。Claude Code CLI 不能直接听音频：不得声称已听音；每项更正必须引用 primary、whisper 或 both 文本证据。无法从两份识别稿支持的分歧记入 unresolved，保留原始台词，不得按语境猜词。保留原稿、第二稿和来源时间戳；将校对稿同步写入 `transcript.json`。若没有 Whisper 第二稿，原文不变并标记 `manual_review_required`。
+
+### 1b. 口播流畅度 pass
+
+在写 `edit-plan.json` 之前必须调用 `mcp__video__analyze_fluency`；当前已有 `timeline.json` 时传入该文件，全新项目还没有时省略 timeline 参数。把返回的 `fluency-report.json` 列入 `manifest.sources`。该报告必须覆盖：
+
+- 硬填充词：`呃/嗯/额/唔` 等默认删除；
+- 假起和重复起句：只有在语义上不损失信息时删除；
+- 软语气词：`啊/呢/吧/嘛/呀/哈` 只标记复核，不能自动删除；
+- 短语内停顿、句间停顿和段落停顿；按报告给出的目标长度执行；
+- 可执行的 `proposedPieces`，不能只写“已删除停顿”。
+
+默认不做全局变速。优先通过删停顿、删假起和重录片段改善语速；只有明确保留的语义段落才考虑节奏调整。重建基础视频后必须重新计算 `timeline.json` 和 `captions.srt`，保持单词完整和音画同步。渲染前调用 `mcp__video__verify_fluency`；`passed` 必须为 `true`，残余长停顿和硬填充词不能靠备注绕过。
 
 ### 2. 建立 beat map
 
@@ -131,7 +152,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
   "phase": "plan",
   "main": "preview.mp4",
   "subtitle": "captions.srt",
-  "sources": ["edit.py", "captions.ass"],
+  "sources": ["edit.py", "captions.ass", "fluency-report.json"],
   "shorts": [],
   "broll": [{"assetId":"...","startMs":0,"endMs":1000,"sourceStartMs":0,"reviewTimeSeconds":1.2}],
   "hyperframes": {"rendered": true, "source": "overlay/index.html", "reviewTimeSeconds": 1.2},
@@ -150,7 +171,7 @@ description: Edit real talking-head videos with Claude Code, word-timed transcri
   "phase": "render",
   "main": "final.mp4",
   "subtitle": "captions.srt",
-  "sources": ["edit.py", "captions.ass", "edit-report.md"],
+  "sources": ["edit.py", "captions.ass", "edit-report.md", "fluency-report.json"],
   "shorts": [{"path":"short-01.mp4","title":"...","slot":1}],
   "broll": [],
   "hyperframes": {"rendered": true, "source": "overlay/index.html", "reviewTimeSeconds": 1.2},

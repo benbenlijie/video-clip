@@ -10,6 +10,7 @@ import {
   analyzeVideoEdit,
   compareVideoEdits,
   createContactSheet,
+  cropFrameRegion,
   persistAnalysis,
   persistComparison,
   renderFrame,
@@ -192,6 +193,46 @@ export async function startEditReviewTools(workDir, auditPath) {
         };
       } catch (error) {
         await audit({ tool: "view_frame", ok: false, error: error.message });
+        return { isError: true, content: [{ type: "text", text: error.message }] };
+      }
+    },
+  );
+
+  server.registerTool(
+    "view_frame_region",
+    {
+      description:
+        "Return one exact frame region, cropped and upscaled from the original video resolution. Use normalized x/y/width/height for typography detail: title band, identity card, caption band, logo or small graphics. The returned crop is suitable for comparing font skeleton, weight, letter spacing, stroke thickness, shadow, panel color/opacity and padding.",
+      inputSchema: {
+        video: z.string().min(1).describe("Workspace-relative video path."),
+        timeSeconds: z.number().min(0).describe("Exact timestamp in seconds."),
+        region: z.object({
+          x: z.number().min(0).max(1),
+          y: z.number().min(0).max(1),
+          width: z.number().min(0.01).max(1),
+          height: z.number().min(0.01).max(1),
+        }).strict().describe("Normalized crop region; x+width and y+height must not exceed 1."),
+        scale: z.number().min(1).max(4).default(2).describe("Upscale factor using Lanczos."),
+      },
+    },
+    async ({ video, timeSeconds, region, scale }) => {
+      try {
+        const target = await workspacePath(root, video);
+        const outputDirectory = await workspacePath(root, ".edit-review/regions", { existing: false });
+        const outputPath = join(
+          outputDirectory,
+          `${randomUUID().slice(0, 8)}-${String(timeSeconds).replaceAll(".", "_")}-${Math.round(region.x * 1000)}-${Math.round(region.y * 1000)}.png`,
+        );
+        const result = await cropFrameRegion(target, { timeSeconds, region, scale, outPath: outputPath });
+        await audit({ tool: "view_frame_region", ok: true, video, timeSeconds, region, scale, path: toRelative(root, outputPath) });
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ ...result, path: toRelative(root, outputPath) }) },
+            await imageContent(outputPath, "image/png"),
+          ],
+        };
+      } catch (error) {
+        await audit({ tool: "view_frame_region", ok: false, error: error.message });
         return { isError: true, content: [{ type: "text", text: error.message }] };
       }
     },

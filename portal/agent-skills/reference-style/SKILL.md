@@ -76,13 +76,15 @@ absent, stop.
    field at zero. Likewise, declare unsupported motion or composition instead of
    inventing evidence.
 
-   Also submit a required `styleSpec` with `contract: "style-spec.v2"`.
+   Also submit a required `styleSpec` with `contract: "style-spec.v3"` for new work
+   (v2 remains accepted for old packs).
    Populate structured `canvas`, `title`, `identity`, `captions`, and `effects`
    tokens. In particular:
 
    - title/caption `panel`: enabled, color, opacity, radius, padding, blur
-   - `primary`/`secondary`/`typography`: font family, weight, size ratio,
+   - `primary`/`secondary`/`typography`: font family/id, width scale, weight, size ratio,
      line height, letter spacing, fill, stroke, and shadow
+   - identity `offsetYRatio` and `maxLines`
    - `motion.enter` and `motion.exit`: type, duration, delay, easing, scale,
      translate, stagger
    - caption `highlight`: strategy, accent color, stroke, peak scale, duration
@@ -109,6 +111,12 @@ absent, stop.
    effect tokens; use `captionStyle` only as a v1 fallback. Use the installed
    Remotion skill for animation and transparent-layer rules. Do not add
    dependencies or runtime network access.
+   `fontWidthScale` must affect both the visible glyphs and the layout width;
+   never apply transform-only `scaleX` without compensating box width, because
+   title fitting and line wrapping will still use the unscaled width. With the
+   installed static Noto Sans CJK family, keep it at `1.0` unless a same-title
+   proof confirms the layout-safe implementation. Never emit placeholder copy
+   such as “用户身份信息” or “6 秒预览”; omit an empty layer instead.
 8. Call `mcp__style__validate_style_project`. It runs the policy scan, sandbox,
    and alpha proof render. If validation fails, make at most two targeted
    repairs and revalidate. If `save_style_pack` or `view_frame` returns

@@ -15,7 +15,8 @@
     "manifest": {
       "oneOf": [
         { "$ref": "style-manifest.v1.schema.json" },
-        { "$ref": "style-manifest.v2.schema.json" }
+        { "$ref": "style-manifest.v2.schema.json" },
+        { "$ref": "style-manifest.v3.schema.json" }
       ]
     },
     "manifestSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },

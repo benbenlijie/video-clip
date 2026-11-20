@@ -107,6 +107,11 @@
         "layout": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
-    "styleSpec": { "$ref": "style-spec.v2.schema.json" }
+    "styleSpec": {
+      "oneOf": [
+        { "$ref": "style-spec.v2.schema.json" },
+        { "$ref": "style-spec.v3.schema.json" }
+      ]
+    }
   }
 }

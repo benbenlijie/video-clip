@@ -681,6 +681,56 @@ export async function renderFrame(videoPath, timeSeconds, outPath) {
   return outPath;
 }
 
+export async function cropFrameRegion(videoPath, {
+  timeSeconds = 0,
+  region,
+  scale = 2,
+  outPath,
+} = {}) {
+  if (!outPath) throw new Error("outPath is required");
+  const probe = await probeEditVideo(videoPath);
+  const values = {
+    x: Number(region?.x),
+    y: Number(region?.y),
+    width: Number(region?.width),
+    height: Number(region?.height),
+  };
+  if (Object.values(values).some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
+    throw new Error("region x/y/width/height must be normalized values between 0 and 1");
+  }
+  if (values.width <= 0 || values.height <= 0 || values.x + values.width > 1.000001 || values.y + values.height > 1.000001) {
+    throw new Error("region must stay inside the normalized video frame");
+  }
+  const factor = clamp(Number(scale) || 2, 1, 4);
+  const x = Math.max(0, Math.min(probe.width - 1, Math.floor(values.x * probe.width)));
+  const y = Math.max(0, Math.min(probe.height - 1, Math.floor(values.y * probe.height)));
+  const width = Math.max(2, Math.min(probe.width - x, Math.round(values.width * probe.width)));
+  const height = Math.max(2, Math.min(probe.height - y, Math.round(values.height * probe.height)));
+  const outputWidth = Math.max(2, Math.round(width * factor));
+  const outputHeight = Math.max(2, Math.round(height * factor));
+  await fs.mkdir(dirname(outPath), { recursive: true });
+  const result = await runProcess("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-ss", String(Math.max(0, Number(timeSeconds) || 0)),
+    "-i", videoPath,
+    "-frames:v", "1",
+    "-vf", `crop=${width}:${height}:${x}:${y},scale=${outputWidth}:${outputHeight}:flags=lanczos`,
+    "-q:v", "2",
+    outPath,
+  ], { timeoutMs: 30000 });
+  requireSuccess(result, "region frame extraction");
+  return {
+    path: outPath,
+    timeSeconds: Math.max(0, Number(timeSeconds) || 0),
+    region: values,
+    source: { width: probe.width, height: probe.height },
+    cropPx: { x, y, width, height },
+    output: { width: outputWidth, height: outputHeight, scale: factor },
+  };
+}
+
 export async function persistAnalysis(root, analysis) {
   const directory = join(root, ".edit-review", "analyses");
   await fs.mkdir(directory, { recursive: true });

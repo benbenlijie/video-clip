@@ -23,6 +23,7 @@ description: Evaluate or compare the editing form of talking-head videos with pr
 - `compare_edits`：两条视频的指标与差值；
 - `extract_contact_sheet`：低成本查看全片代表帧；
 - `view_frame`：查看精确时间点的证据帧；
+- `view_frame_region`：按归一化区域从原分辨率裁切并放大，查看标题、身份卡、字幕等排版细节；
 - `write_review_report`：写入版式化 JSON 与 Markdown 报告。
 
 如果 MCP 不可用，明确说明无法完成可复核评价，不要用猜测代替测量或画面证据。
@@ -64,6 +65,18 @@ description: Evaluate or compare the editing form of talking-head videos with pr
 - 明显的构图、景别、背景或色彩跳变。
 
 如果客户端没有渲染接触表图片，改用 `view_frame` 逐点抽帧；不能把图片文件名、工具成功响应或 JSON 数值当成视觉证据。
+
+### 3b. 看排版细节
+
+在判断字体、描边、底板、字距、行高和安全区之前，读取
+[references/typography-detail.md](references/typography-detail.md)，并对每条视频分别调用
+`view_frame_region`：
+
+- 标题带：`{x:0,y:0,width:1,height:0.22}`；
+- 身份区：根据实际位置取右侧或左侧局部；
+- 字幕区：`{x:0,y:0.70,width:1,height:0.30}`。
+
+比较时使用相同归一化区域和相同放大倍数。整帧观看只能说明层级和位置，不能单独证明字体骨架、描边宽度、阴影或底板透明度相似。
 
 看帧时重点记录：
 

@@ -42,7 +42,7 @@ export type CaptionStyle = {
 };
 
 export type StyleSpecV2 = {
-  contract: "style-spec.v2";
+  contract: "style-spec.v2" | "style-spec.v3";
   canvas: { aspectRatio: string; safeArea: { topRatio: number; rightRatio: number; bottomRatio: number; leftRatio: number } };
   title: {
     anchor: string;
@@ -56,6 +56,8 @@ export type StyleSpecV2 = {
   identity: {
     anchor: string;
     maxWidthRatio: number;
+    offsetYRatio?: number;
+    maxLines?: number;
     panel: { enabled: boolean; color: string; opacity: number; radiusRatio: number; paddingXRatio: number; paddingYRatio: number; blurPx: number };
     primary: Record<string, string | number>;
     secondary: Record<string, string | number>;

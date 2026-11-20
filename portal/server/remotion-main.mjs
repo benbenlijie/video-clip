@@ -40,6 +40,7 @@ export function validateEditMap({ map, plan, sourceDurationMs, durationMs, fps }
   if (!Number.isFinite(fps) || fps <= 0 || fps > 120 || !Number.isFinite(sourceDurationMs) || sourceDurationMs <= 0 || !Number.isFinite(durationMs) || durationMs <= 0) throw new Error("剪辑映射时长或帧率无效");
   if (!Array.isArray(map?.pieces) || !map.pieces.length || map.pieces.length > 10000) throw new Error("缺少实际剪辑映射 pieces");
   const frameMs = 1000 / fps;
+  const frameToleranceMs = 1;
   let cursorMs = 0;
   let previousSourceEnd = 0;
   const pieces = map.pieces.map((piece) => {
@@ -49,7 +50,7 @@ export function validateEditMap({ map, plan, sourceDurationMs, durationMs, fps }
       || startMs < previousSourceEnd - 0.01 || startMs < 0 || endMs <= startMs || endMs > sourceDurationMs + frameMs
       || Math.abs(outputStartMs - cursorMs) > 0.01 || outputEndMs <= outputStartMs
       || Math.abs((endMs - startMs) - (outputEndMs - outputStartMs)) > 0.01
-      || [startMs, endMs, outputStartMs, outputEndMs].some((value) => Math.abs(value / frameMs - Math.round(value / frameMs)) > 0.001)) throw new Error("实际剪辑映射须按帧对齐、顺序且连续，不能重叠或变速");
+      || [startMs, endMs, outputStartMs, outputEndMs].some((value) => Math.abs(value - Math.round(value / frameMs) * frameMs) > frameToleranceMs)) throw new Error("实际剪辑映射须按帧对齐、顺序且连续，不能重叠或变速");
     cursorMs = outputEndMs;
     previousSourceEnd = endMs;
     return { src: [startMs, endMs], out: [outputStartMs, outputEndMs] };
@@ -66,7 +67,7 @@ export function validateEditMap({ map, plan, sourceDurationMs, durationMs, fps }
 }
 
 export function mapRemotionEvents(events, pieces) {
-  return (events || []).flatMap((event) => {
+  const mapped = (events || []).flatMap((event) => {
     if (!SUPPORTED_EVENTS.has(event.type)) throw new Error(`不支持的 Remotion 事件类型: ${event.type}`);
     if (!event.id || !Number.isFinite(event.startMs) || !Number.isFinite(event.endMs) || event.startMs < 0 || event.endMs <= event.startMs || typeof event.text !== "string" || !event.text.trim()) throw new Error("Remotion 动效文字或时间无效");
     return pieces.flatMap((piece, index) => {
@@ -76,6 +77,21 @@ export function mapRemotionEvents(events, pieces) {
       return [{ ...event, id: `${event.id}-part-${index + 1}`, sourceEventId: event.id, startMs: start - piece.src[0] + piece.out[0], endMs: end - piece.src[0] + piece.out[0] }];
     });
   });
+  // Piece boundaries are editorial cuts, not new overlay entrances. Keep a
+  // title/identity that spans adjacent pieces as one continuous event.
+  return mapped.reduce((result, event) => {
+    const previous = result.at(-1);
+    if (previous
+      && previous.sourceEventId === event.sourceEventId
+      && previous.type === event.type
+      && previous.text === event.text
+      && (previous.subtext || "") === (event.subtext || "")
+      && (previous.position || "") === (event.position || "")
+      && Math.abs(previous.endMs - event.startMs) < 0.01) {
+      previous.endMs = event.endMs;
+    } else result.push(event);
+    return result;
+  }, []);
 }
 
 export function mapLayoutEvents(events, pieces) {
@@ -120,7 +136,23 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
   const referenceAnalysis = styleMode
     ? JSON.parse(await fs.readFile(await workspacePath(root, brief.referenceAnalysisPath || "reference-analysis.json"), "utf8"))
     : null;
-  const captionCues = parseWhisperSrt(captions);
+  const renderStyleSpec = styleMode ? (brief.styleSpec || referenceAnalysis?.styleSpec || null) : null;
+  let contentCopy = brief.contentCopy || null;
+  if (styleMode) {
+    try {
+      contentCopy = JSON.parse(await fs.readFile(join(root, "content-copy.json"), "utf8"));
+    } catch {
+      // Older workspaces may only carry the compact copy in brief.json.
+    }
+  }
+  const captionKeywords = Array.isArray(contentCopy?.keywords)
+    ? [...new Set(contentCopy.keywords.map(String).map((value) => value.trim()).filter(Boolean))]
+    : [];
+  const captionCues = parseWhisperSrt(captions).map((cue) => {
+    const normalized = cue.text.replace(/\s+/g, "");
+    const keywords = captionKeywords.filter((keyword) => normalized.includes(keyword.replace(/\s+/g, "")));
+    return keywords.length ? { ...cue, keywords } : cue;
+  });
   const renderedCaptionCues = styleMode
     ? regroupCaptionCues(captionCues, brief.styleApplication?.captionPolicy?.wordsPerCue)
     : captionCues;
@@ -174,6 +206,9 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
     const timeline = { contract: "timeline.v1", media: { width: probe.width, height: probe.height, fps: probe.fps, durationMs: probe.videoDurationMs }, visualEvents: events };
     await fs.writeFile(join(root, paths.inputPath), JSON.stringify({ ...timeline.media, events, pieces, captionStyle }, null, 2), { flag: "wx" });
     hashes.input = await fileHash(join(root, paths.inputPath));
+    // Keep the overlay a few frames longer than the base so the final
+    // `-shortest` composite is not trimmed by Remotion's ceil-down frame count.
+    const overlayDurationMs = styleMode ? probe.videoDurationMs + 250 : probe.videoDurationMs;
     const overlay = styleMode
       ? await renderStyleProject({
           projectDir: styleProjectDir,
@@ -183,13 +218,13 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
             width: probe.width,
             height: probe.height,
             fps: probe.fps,
-            durationMs: probe.videoDurationMs,
+            durationMs: overlayDurationMs,
             captions: renderedCaptionCues,
             visualEvents: events,
             layoutEvents,
             styleParams: plan.styleParameters || brief.styleParameters || {},
             captionStyle,
-            styleSpec: referenceAnalysis?.styleSpec || null,
+            styleSpec: renderStyleSpec,
           },
         })
       : await renderRemotionOverlay({ timeline, outputPath: join(root, paths.overlayPath), workDir: outputDir });
@@ -205,7 +240,13 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
     });
     const finalProbe = await probeOutput(output.outputPath);
     const black = await detectBlackFrames(output.outputPath);
-    if (Math.abs(finalProbe.videoDurationMs - probe.videoDurationMs) > 1000 / probe.fps + 1 || finalProbe.width !== probe.width || finalProbe.height !== probe.height || finalProbe.avSyncDeltaMs === null || finalProbe.avDurationDeltaMs === null || finalProbe.avSyncDeltaMs > 250 || finalProbe.avDurationDeltaMs > 250 || black.length) {
+    const frameMs = 1000 / probe.fps;
+    // MP4 stream duration can omit up to three trailing frames even when the
+    // container and audio carry the full timeline; keep the format duration strict.
+    const streamTailToleranceMs = frameMs * 3 + 1;
+    if (Math.abs(finalProbe.durationMs - probe.videoDurationMs) > frameMs + 1
+      || Math.abs(finalProbe.videoDurationMs - probe.videoDurationMs) > streamTailToleranceMs
+      || finalProbe.width !== probe.width || finalProbe.height !== probe.height || finalProbe.avSyncDeltaMs === null || finalProbe.avDurationDeltaMs === null || finalProbe.avSyncDeltaMs > 250 || finalProbe.avDurationDeltaMs > 250 || black.length) {
       throw new Error(`Remotion 主视频未通过画幅、时长、音画同步或黑帧检查：${JSON.stringify({
         expected: { width: probe.width, height: probe.height, videoDurationMs: probe.videoDurationMs, fps: probe.fps },
         actual: { width: finalProbe.width, height: finalProbe.height, videoDurationMs: finalProbe.videoDurationMs, avSyncDeltaMs: finalProbe.avSyncDeltaMs, avDurationDeltaMs: finalProbe.avDurationDeltaMs },
@@ -226,7 +267,9 @@ export async function composeRemotionMain({ root, baseVideo, phase }) {
       let faceFrames = [];
       let faceDetectionAvailable = true;
       try {
-        faceFrames = await detectFaceFrames(output.outputPath, { maxSamples: 12 });
+        // Detect faces on the clean base footage; burned captions can be
+        // mistaken for faces by the Haar detector.
+        faceFrames = await detectFaceFrames(basePath, { maxSamples: 12 });
       } catch {
         faceDetectionAvailable = false;
       }
